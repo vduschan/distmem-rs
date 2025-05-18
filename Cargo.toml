@@ -1,0 +1,12 @@
+[package]
+name = "distmem-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Distributed Shared Memory (DSM) with built-in synchronization and consistency protocols."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/vduschan/distmem-rs"
+readme = "README.md"
+keywords = ["distributed", "memory"]
+categories = ["data-structures", "network-programming"]
+
+[dependencies]
