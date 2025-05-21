@@ -1,0 +1,55 @@
+repos:
+-   repo: local
+    hooks:
+    -   id: cargo-fmt
+        name: Cargo Fmt
+        language: system
+        entry: sh -c
+        args: ['cargo fmt --all --check']
+        pass_filenames: false
+    -   id: cargo-clippy
+        name: Cargo Clippy
+        language: system
+        entry: sh -c
+        args: ['cargo clippy --workspace --all-features --all-targets -- -Dwarnings']
+        pass_filenames: false
+    -   id: cargo-build
+        name: Cargo Build
+        language: system
+        entry: sh -c
+        args: ['cargo build --workspace --all-features --all-targets']
+        pass_filenames: false
+    -   id: cargo-doc
+        name: Cargo Doc
+        language: system
+        entry: sh -c
+        args: ['cargo doc --workspace --all-features']
+        pass_filenames: false
+    -   id: cargo-test
+        name: Cargo Test
+        language: system
+        entry: sh -c
+        args: ['cargo test --workspace --all-features']
+        pass_filenames: false
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+    -   id: no-commit-to-branch # don't commit to branch
+        args: [--branch, main]
+    -   id: detect-private-key # detects the presence of private keys
+    -   id: check-yaml # checks yaml files for parseable syntax
+    -   id: check-toml # checks toml files for parseable syntax
+    -   id: check-json # checks json files for parseable syntax
+    -   id: check-xml # checks xml files for parseable syntax
+    -   id: check-symlinks # checks for symlinks which do not point to anything
+    -   id: destroyed-symlinks # detects symlinks which are changed to regular files with a content of a path which that symlink was pointing to
+    -   id: check-added-large-files # prevents giant files from being committed
+    -   id: check-merge-conflict # checks for files that contain merge conflict strings
+    -   id: check-executables-have-shebangs # ensures that (non-binary) executables have a shebang
+    -   id: check-shebang-scripts-are-executable # ensures that (non-binary) files with a shebang are executable
+    -   id: trailing-whitespace # trims trailing whitespace
+    -   id: end-of-file-fixer # ensures that a file is either empty, or ends with one newline
+    -   id: pretty-format-json # sets a standard for formatting json files
+        args: [--autofix, --no-sort-keys]
+    -   id: requirements-txt-fixer # sorts entries in requirementstxt
+    -   id: double-quote-string-fixer # replaces double quoted strings with single quoted strings
