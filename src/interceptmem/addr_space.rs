@@ -1,12 +1,13 @@
-use std::{num::NonZeroUsize, ops::Range};
+use std::{ffi::c_void, num::NonZeroUsize, ops::Range, ptr::NonNull};
 
 use nix::{
     errno::Errno,
     sys::mman::{MapFlags, ProtFlags},
 };
+use rangemap::RangeMap;
 use thiserror::Error;
 
-use super::page_addr::PageAddr;
+use super::page_addr::{PageAddr, RangeExt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -24,8 +25,16 @@ pub struct PageFault {
     access: SomePageAccess,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PageState {
+    access: PageAccess,
+}
+
 #[allow(dead_code)]
-pub struct AddrSpace();
+#[derive(Debug)]
+pub struct AddrSpace {
+    pages: RangeMap<PageAddr, Option<PageState>>,
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Error)]
@@ -40,7 +49,12 @@ pub enum AddrSpaceError {
 impl AddrSpace {
     #[allow(dead_code)]
     pub fn new() -> (AddrSpace, AddrSpaceFaultReceiver) {
-        todo!()
+        (
+            AddrSpace {
+                pages: Default::default(),
+            },
+            AddrSpaceFaultReceiver(),
+        )
     }
 
     /// Reserves a range of pages of the specified length for address space use.
@@ -50,11 +64,31 @@ impl AddrSpace {
     /// Returns a `Range<PageAddr>` representing the reserved range if successful,
     /// otherwise returns an error.
     #[allow(dead_code)]
-    pub fn reserve_any(
-        &mut self,
-        _length: NonZeroUsize,
-    ) -> Result<Range<PageAddr>, AddrSpaceError> {
-        todo!()
+    pub fn reserve_any(&mut self, length: NonZeroUsize) -> Result<Range<PageAddr>, AddrSpaceError> {
+        let mmapped = unsafe {
+            nix::sys::mman::mmap_anonymous(
+                None,
+                length,
+                ProtFlags::PROT_NONE,
+                MapFlags::MAP_PRIVATE,
+            )
+        }
+        .map_err(|errno| AddrSpaceError::RuntimeError {
+            msg: format!("mmap with len {} failed", length),
+            errno,
+        })?;
+        let mmapped = unsafe { util::MmapGuard::from_raw(mmapped, length) };
+
+        let reserved = PageAddr::try_from(mmapped.addr())
+            .expect("`mmap_anonymous` should've returned a page address");
+        let reserved = reserved.enclosing_range(mmapped.length()).expect(
+            "`mmap_anonymous` should've returned pages that can be represented by the `PageAddr`",
+        );
+
+        assert!(!self.pages.overlaps(&reserved));
+        self.pages.insert(reserved.clone(), None);
+        mmapped.consume();
+        Ok(reserved)
     }
 
     /// Reserves the specified range of pages for address space use.
@@ -63,8 +97,41 @@ impl AddrSpace {
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn reserve(&mut self, _range: Range<PageAddr>) -> Result<(), AddrSpaceError> {
-        todo!()
+    pub fn reserve(&mut self, range: Range<PageAddr>) -> Result<(), AddrSpaceError> {
+        if self.pages.overlaps(&range) {
+            return Err(AddrSpaceError::InvalidRange {
+                msg: "part of the range already reserved".into(),
+            });
+        }
+
+        let addr: NonNull<c_void> = range.start.into();
+        let addr: NonZeroUsize = (addr.as_ptr() as usize)
+            .try_into()
+            .expect("non-null ptr is non-0");
+        let length = range.len();
+        let mmapped = unsafe {
+            nix::sys::mman::mmap_anonymous(
+                Some(addr),
+                length,
+                ProtFlags::PROT_NONE,
+                MapFlags::MAP_PRIVATE.union(MapFlags::MAP_FIXED_NOREPLACE),
+            )
+        }
+        .map_err(|errno| AddrSpaceError::RuntimeError {
+            msg: "mmap failed".into(),
+            errno,
+        })?;
+        let mmapped = unsafe { util::MmapGuard::from_raw(mmapped, length) };
+
+        let reserved = PageAddr::try_from(mmapped.addr())
+            .expect("`mmap_anonymous` should've returned a page address");
+        let reserved = reserved.enclosing_range(mmapped.length()).expect(
+            "`mmap_anonymous` should've returned pages that can be represented by the `PageAddr`",
+        );
+
+        self.pages.insert(reserved, None);
+        mmapped.consume();
+        Ok(())
     }
 
     /// Releases a previously reserved range of pages from address space.
@@ -194,5 +261,94 @@ impl AddrSpaceFaultReceiver {
     #[allow(dead_code)]
     pub fn recv(&self) -> Result<PageFault, AddrSpaceFaultReceiver> {
         todo!()
+    }
+}
+
+mod util {
+    use std::{ffi::c_void, num::NonZeroUsize, ptr::NonNull};
+
+    /// Guard for `nix::sys::mman::mmap`ped range of pages.
+    pub(super) struct MmapGuard(Option<(NonNull<c_void>, NonZeroUsize)>);
+    impl MmapGuard {
+        pub unsafe fn from_raw(addr: NonNull<c_void>, length: NonZeroUsize) -> Self {
+            Self(Some((addr, length)))
+        }
+        pub fn addr(&self) -> NonNull<c_void> {
+            self.0
+                .expect("invariant: inner data is `Some` until `consume`d")
+                .0
+        }
+        pub fn length(&self) -> NonZeroUsize {
+            self.0
+                .expect("invariant: inner data is `Some` until `consume`d")
+                .1
+        }
+        pub fn consume(mut self) -> (NonNull<c_void>, NonZeroUsize) {
+            self.0
+                .take()
+                .expect("invariant: inner data is `Some` until `consume`d")
+        }
+    }
+    impl Drop for MmapGuard {
+        fn drop(&mut self) {
+            if let Some((addr, length)) = self.0 {
+                unsafe { nix::sys::mman::munmap(addr, length.get()).unwrap() };
+            }
+        }
+    }
+}
+
+impl Drop for AddrSpace {
+    fn drop(&mut self) {
+        for (range, state) in self.pages.iter() {
+            if let Some(_state) = state {
+                todo!();
+            } else {
+                unsafe {
+                    nix::sys::mman::munmap(range.start.into(), range.len().get())
+                        .expect("`munmap` should've succeeded on reserved range");
+                };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::interceptmem::{addr_space::util::MmapGuard, page_addr::PAGE_SIZE};
+
+    use super::*;
+
+    #[test]
+    fn test_addr_space_reserve_any() {
+        let (mut addrspace, _fault_receiver) = AddrSpace::new();
+        let reserved = addrspace.reserve_any(1.try_into().unwrap()).unwrap();
+        assert_eq!(reserved.len().get(), PAGE_SIZE);
+
+        let inner_reserved = addrspace.pages.get_key_value(&reserved.start).unwrap();
+        assert_eq!(*inner_reserved.0, reserved);
+        assert_eq!(*inner_reserved.1, None);
+    }
+
+    #[test]
+    fn test_addr_space_reserve() {
+        let mmapped = unsafe {
+            nix::sys::mman::mmap_anonymous(
+                None,
+                PAGE_SIZE.try_into().unwrap(),
+                ProtFlags::PROT_NONE,
+                MapFlags::MAP_PRIVATE,
+            )
+            .unwrap()
+        };
+        let mmapped = unsafe { MmapGuard::from_raw(mmapped, PAGE_SIZE.try_into().unwrap()) };
+        let occupied: PageAddr = mmapped.addr().try_into().unwrap();
+        let occupied = occupied.enclosing_range(mmapped.length()).unwrap();
+
+        let (mut addrspace, _fault_receiver) = AddrSpace::new();
+
+        // AddrSpace shouldn't reserve externally mmapped range
+        let result = addrspace.reserve(occupied.clone());
+        assert!(result.is_err());
     }
 }

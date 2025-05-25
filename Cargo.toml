@@ -12,3 +12,4 @@ categories = ["data-structures", "network-programming"]
 [dependencies]
 thiserror = "2.0.12"
 nix = { version = "0.30.1", features = ["mman"] }
+rangemap = "1.5.1"
