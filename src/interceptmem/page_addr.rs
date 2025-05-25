@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::{ffi::c_void, num::NonZeroUsize, ops::Range, ptr::NonNull};
 
 #[allow(dead_code)]
 pub const PAGE_BITS: usize = 12;
@@ -20,5 +20,91 @@ impl std::fmt::Display for PageAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Delegate to Debug
         write!(f, "{:?}", self)
+    }
+}
+
+impl TryFrom<NonNull<c_void>> for PageAddr {
+    type Error = ();
+
+    fn try_from(value: NonNull<c_void>) -> Result<Self, Self::Error> {
+        let addr = NonZeroUsize::new(value.as_ptr() as usize).expect("non-null ptr is non-0");
+        if addr.get() % PAGE_SIZE != 0 {
+            return Err(());
+        }
+        Ok(PageAddr(addr))
+    }
+}
+
+impl From<PageAddr> for NonNull<c_void> {
+    fn from(value: PageAddr) -> Self {
+        NonNull::new(value.0.get() as *mut c_void).expect("non-0 usize is non-null ptr")
+    }
+}
+
+impl PageAddr {
+    pub fn enclosing_range(self, length: NonZeroUsize) -> Option<Range<PageAddr>> {
+        let end_addr = self.0.checked_add(length.get())?;
+        let end_page_addr = end_addr.saturating_add(PAGE_SIZE - 1).get() & PAGE_MASK;
+        Some(self..PageAddr(NonZeroUsize::new(end_page_addr).expect("end page should be > 0")))
+    }
+}
+
+#[allow(dead_code)]
+pub trait RangeExt {
+    fn len(&self) -> NonZeroUsize;
+}
+
+impl RangeExt for Range<PageAddr> {
+    fn len(&self) -> NonZeroUsize {
+        let length = self
+            .end
+            .0
+            .get()
+            .checked_sub(self.start.0.get())
+            .expect("invariant: start page should be < than end page");
+        NonZeroUsize::new(length).expect("invariant: start page should be < than end page")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_try_from_nonnull() {
+        let ptr = NonNull::new((42 * PAGE_SIZE) as *mut c_void).unwrap();
+        let addr = PageAddr::try_from(ptr).unwrap();
+        assert_eq!(addr.0, NonZeroUsize::new(42 * PAGE_SIZE).unwrap());
+
+        let ptr_not_page_aligned = NonNull::new((42 * PAGE_SIZE + 1) as *mut c_void).unwrap();
+        let result = PageAddr::try_from(ptr_not_page_aligned);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_page_addr_to_nonnull() {
+        let addr = PageAddr(NonZeroUsize::new(42 * PAGE_SIZE).unwrap());
+        let ptr: NonNull<c_void> = addr.into();
+        assert_eq!(ptr.as_ptr() as usize, 42 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn test_enclosing_range() {
+        let addr = PageAddr(NonZeroUsize::new(42 * PAGE_SIZE).unwrap());
+        let length = NonZeroUsize::new(PAGE_SIZE + 1).unwrap();
+        let range = addr.enclosing_range(length).unwrap();
+        assert_eq!(range.start, addr);
+        assert_eq!(
+            range.end,
+            PageAddr(NonZeroUsize::new(44 * PAGE_SIZE).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_range_ext_len() {
+        let start = PageAddr(NonZeroUsize::new(42 * PAGE_SIZE).unwrap());
+        let end = PageAddr(NonZeroUsize::new(44 * PAGE_SIZE).unwrap());
+        let range = start..end;
+        assert_eq!(range.len(), NonZeroUsize::new(2 * PAGE_SIZE).unwrap());
     }
 }
