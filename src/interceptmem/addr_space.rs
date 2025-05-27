@@ -17,7 +17,10 @@ use nix::{
 use rangemap::RangeMap;
 use thiserror::Error;
 
-use super::page_addr::{PageAddr, RangeExt};
+use super::{
+    page_addr::{PageAddr, RangeExt},
+    userfaultfd_create::{UserfaultFdFlags, userfaultfd_create},
+};
 
 use userfaultfd as uffd;
 
@@ -79,17 +82,16 @@ impl AddrSpace {
             .union(uffd::IoctlFlags::API);
 
         let uffd = Arc::new(
-            uffd::UffdBuilder::new()
-                .user_mode_only(user_mode_only)
-                .non_blocking(true)
-                .close_on_exec(true)
-                .require_features(required_features)
-                .require_ioctls(required_ioctls)
-                .create()
-                .map_err(|err| AddrSpaceError::RuntimeError {
-                    msg: format!("userfaultfd failed during creation with: {}", err),
-                    errno: Errno::UnknownErrno,
-                })?,
+            userfaultfd_create(
+                UserfaultFdFlags {
+                    user_mode_only,
+                    non_blocking: true,
+                    close_on_exec: false,
+                },
+                required_features,
+                required_ioctls,
+            )
+            .unwrap(),
         );
 
         let (alive_rx, alive_tx) = pipe().map_err(|errno| AddrSpaceError::RuntimeError {
