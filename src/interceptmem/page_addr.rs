@@ -28,7 +28,7 @@ impl TryFrom<NonNull<c_void>> for PageAddr {
 
     fn try_from(value: NonNull<c_void>) -> Result<Self, Self::Error> {
         let addr = NonZeroUsize::new(value.as_ptr() as usize).expect("non-null ptr is non-0");
-        if addr.get() % PAGE_SIZE != 0 {
+        if addr.get() & !PAGE_MASK != 0 {
             return Err(());
         }
         Ok(PageAddr(addr))
@@ -42,6 +42,10 @@ impl From<PageAddr> for NonNull<c_void> {
 }
 
 impl PageAddr {
+    pub fn containing_page(value: NonNull<c_void>) -> Option<PageAddr> {
+        let addr = (value.as_ptr() as usize) & PAGE_MASK;
+        Some(PageAddr(NonZeroUsize::new(addr)?))
+    }
     pub fn enclosing_range(self, length: NonZeroUsize) -> Option<Range<PageAddr>> {
         let end_addr = self.0.checked_add(length.get())?;
         let end_page_addr = end_addr.saturating_add(PAGE_SIZE - 1).get() & PAGE_MASK;
@@ -77,8 +81,7 @@ mod tests {
         assert_eq!(addr.0, NonZeroUsize::new(42 * PAGE_SIZE).unwrap());
 
         let ptr_not_page_aligned = NonNull::new((42 * PAGE_SIZE + 1) as *mut c_void).unwrap();
-        let result = PageAddr::try_from(ptr_not_page_aligned);
-        assert!(result.is_err());
+        assert!(PageAddr::try_from(ptr_not_page_aligned).is_err());
     }
 
     #[test]
@@ -89,8 +92,18 @@ mod tests {
     }
 
     #[test]
+    fn test_containing_page() {
+        let ptr_not_page_aligned = NonNull::new((42 * PAGE_SIZE + 1) as *mut c_void).unwrap();
+        let addr = PageAddr::containing_page(ptr_not_page_aligned).unwrap();
+        assert_eq!(addr.0, NonZeroUsize::new(42 * PAGE_SIZE).unwrap());
+
+        let ptr_null_page = NonNull::new(1 as *mut c_void).unwrap();
+        assert!(PageAddr::containing_page(ptr_null_page).is_none());
+    }
+
+    #[test]
     fn test_enclosing_range() {
-        let addr = PageAddr(NonZeroUsize::new(42 * PAGE_SIZE).unwrap());
+        let addr: PageAddr = PageAddr(NonZeroUsize::new(42 * PAGE_SIZE).unwrap());
         let length = NonZeroUsize::new(PAGE_SIZE + 1).unwrap();
         let range = addr.enclosing_range(length).unwrap();
         assert_eq!(range.start, addr);
