@@ -364,7 +364,7 @@ impl AddrSpace {
         if flags.contains(MapFlags::MAP_FIXED) || flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
             if !self.is_reserved(range) {
                 return Err(AddrSpaceError::InvalidRange {
-                    msg: "range not reserved".into(),
+                    msg: "part of the range not reserved".into(),
                 });
             }
             assert!(!flags.contains(MapFlags::MAP_FIXED)); // this is impossible
@@ -403,11 +403,71 @@ impl AddrSpace {
     #[allow(dead_code)]
     pub fn give_access(
         &mut self,
-        _range: &Range<PageAddr>,
-        _access: SomePageAccess,
-        _data: Option<&[u8]>,
+        range: &Range<PageAddr>,
+        access: SomePageAccess,
+        data: Option<&[u8]>,
     ) -> Result<(), AddrSpaceError> {
-        todo!();
+        if let Some(data) = data {
+            if data.len() != range.len().get() {
+                return Err(AddrSpaceError::InvalidRange {
+                    msg: "range and data has to have the same length".into(),
+                });
+            }
+        }
+
+        // Check if range is valid to give it access
+        match self.pages.get_key_value(&range.start) {
+            Some((reserved, Some(state))) => {
+                if reserved.start > range.start
+                    || reserved.end < range.end
+                    || state.access.is_some()
+                {
+                    return Err(AddrSpaceError::InvalidRange {
+                        msg: "part of the range not reserved, not mapped or already has access"
+                            .into(),
+                    });
+                }
+            }
+            Some((_reserved, &None)) => {
+                return Err(AddrSpaceError::InvalidRange {
+                    msg: "part of the range not mapped".into(),
+                });
+            }
+            None => {
+                return Err(AddrSpaceError::InvalidRange {
+                    msg: "part of the range not reserved".into(),
+                });
+            }
+        };
+
+        if access == SomePageAccess::ReadOnly {
+            todo!()
+        }
+        let addr = NonNull::from(range.start).as_ptr();
+        let length = range.len().get();
+        if let Some(data) = data {
+            let copied = unsafe { self.uffd.copy(data.as_ptr() as *mut _, addr, length, true) }
+                .map_err(|err| AddrSpaceError::RuntimeError {
+                    msg: format!("userfaultfd copy failed with: {}", err),
+                    errno: Errno::UnknownErrno,
+                })?;
+            assert_eq!(copied, length);
+        } else {
+            let zeroed = unsafe { self.uffd.zeropage(addr, length, true) }.map_err(|err| {
+                AddrSpaceError::RuntimeError {
+                    msg: format!("userfaultfd zeropage failed with: {}", err),
+                    errno: Errno::UnknownErrno,
+                }
+            })?;
+            assert_eq!(zeroed, length);
+        }
+        self.pages.insert(
+            range.clone(),
+            Some(PageState {
+                access: Some(access),
+            }),
+        );
+        Ok(())
     }
 
     /// Updates access to a previously mapped range of pages that has some access.
@@ -595,7 +655,7 @@ impl Drop for AddrSpace {
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
+    use std::{sync::RwLock, thread};
 
     use crate::interceptmem::{addr_space::util::MmapGuard, page_addr::PAGE_SIZE};
 
@@ -634,23 +694,45 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[ignore] // handling page faults isn't yet implemented
     #[test]
     fn test_addr_space_mmap_any() {
-        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let (addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let addrspace = Arc::new(RwLock::new(addrspace));
+
+        let addrspace_weak = Arc::downgrade(&addrspace);
         let engine_thread = thread::spawn(move || {
             engine
                 .run(|pagefault| {
-                    println!("Got page fault {:?}", pagefault);
-                    todo!()
+                    println!("Got {:?}", pagefault);
+                    let addrspace = if let Some(addrspace) = addrspace_weak.upgrade() {
+                        addrspace
+                    } else {
+                        println!("AddrSpace is dropped");
+                        return Ok(());
+                    };
+
+                    let addr =
+                        PageAddr::containing_page(NonNull::new(pagefault.addr).unwrap()).unwrap();
+                    let range = addr.enclosing_range(NonZeroUsize::new(1).unwrap()).unwrap();
+                    let data: [u8; PAGE_SIZE] = [42; PAGE_SIZE];
+                    addrspace
+                        .write()
+                        .unwrap()
+                        .give_access(&range, SomePageAccess::ReadWrite, Some(&data))
+                        .unwrap();
+                    Ok(())
                 })
                 .unwrap();
         });
 
         let reserved = addrspace
+            .write()
+            .unwrap()
             .reserve_any((10 * PAGE_SIZE).try_into().unwrap())
             .unwrap();
         let mmapped = addrspace
+            .write()
+            .unwrap()
             .map_anonymous_any(
                 reserved.len(),
                 ProtFlags::PROT_READ.union(ProtFlags::PROT_WRITE),
@@ -660,7 +742,8 @@ mod tests {
         assert_eq!(reserved, mmapped);
 
         let val_ptr = NonNull::from(mmapped.start).as_ptr() as *mut u8;
-        let _val = unsafe { *(val_ptr) };
+        let val = unsafe { *(val_ptr) };
+        assert_eq!(val, 42);
 
         drop(addrspace);
         engine_thread.join().unwrap();
