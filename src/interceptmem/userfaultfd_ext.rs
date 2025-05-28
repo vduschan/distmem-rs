@@ -1,12 +1,18 @@
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::{
+    ffi::c_void,
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
+};
 
-use linux_raw_sys::general::{_UFFDIO_API, UFFD_API, UFFD_USER_MODE_ONLY, UFFDIO, uffdio_api};
+use linux_raw_sys::general::{
+    _UFFDIO_API, _UFFDIO_COPY, UFFD_API, UFFD_USER_MODE_ONLY, UFFDIO, UFFDIO_COPY_MODE_DONTWAKE,
+    UFFDIO_COPY_MODE_WP, uffdio_api, uffdio_copy,
+};
 use nix::{
     errno::Errno,
     libc::{INT_MAX, INT_MIN, O_CLOEXEC, O_NONBLOCK, SYS_userfaultfd, c_int, c_long, syscall},
 };
 
-use userfaultfd as uffd;
+use userfaultfd::{self as uffd, Uffd};
 
 fn syscall_userfaultfd(flags: c_int) -> Result<OwnedFd, Errno> {
     let fd = unsafe { syscall(SYS_userfaultfd, flags as c_long) };
@@ -82,4 +88,47 @@ pub fn userfaultfd_create(
         return Err(Errno::ENOTSUP);
     }
     Ok(unsafe { uffd::Uffd::from_raw_fd(fd.into_raw_fd()) })
+}
+
+pub trait UffdExt {
+    unsafe fn copy_with_wp(
+        &self,
+        src: *const c_void,
+        dst: *mut c_void,
+        len: usize,
+        wake: bool,
+        writeprotect: bool,
+    ) -> uffd::Result<usize>;
+}
+
+nix::ioctl_readwrite!(ioctl_uffdio_copy_raw, UFFDIO, _UFFDIO_COPY, uffdio_copy);
+
+impl UffdExt for Uffd {
+    unsafe fn copy_with_wp(
+        &self,
+        src: *const c_void,
+        dst: *mut c_void,
+        len: usize,
+        wake: bool,
+        writeprotect: bool,
+    ) -> userfaultfd::Result<usize> {
+        let mut mode: c_int = 0;
+        if !wake {
+            mode |= UFFDIO_COPY_MODE_DONTWAKE as c_int;
+        }
+        if writeprotect {
+            mode |= UFFDIO_COPY_MODE_WP as c_int;
+        }
+
+        let mut arg = uffdio_copy {
+            dst: dst as _,
+            src: src as _,
+            len: len as _,
+            mode: mode as _,
+            copy: 0,
+        };
+        let ret = unsafe { ioctl_uffdio_copy_raw(self.as_raw_fd(), &mut arg as *mut _) }.unwrap();
+        assert!(ret == 0);
+        Ok(arg.copy as usize)
+    }
 }

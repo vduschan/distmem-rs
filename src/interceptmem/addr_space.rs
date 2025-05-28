@@ -16,10 +16,13 @@ use nix::{
 };
 use rangemap::RangeMap;
 use thiserror::Error;
+use util::MmapGuard;
+
+use crate::interceptmem::userfaultfd_ext::UffdExt;
 
 use super::{
     page_addr::{PageAddr, RangeExt},
-    userfaultfd_create::{UserfaultFdFlags, userfaultfd_create},
+    userfaultfd_ext::{UserfaultFdFlags, userfaultfd_create},
 };
 
 use userfaultfd as uffd;
@@ -440,26 +443,61 @@ impl AddrSpace {
             }
         };
 
-        if access == SomePageAccess::ReadOnly {
-            todo!()
-        }
         let addr = NonNull::from(range.start).as_ptr();
         let length = range.len().get();
         if let Some(data) = data {
-            let copied = unsafe { self.uffd.copy(data.as_ptr() as *mut _, addr, length, true) }
-                .map_err(|err| AddrSpaceError::RuntimeError {
-                    msg: format!("userfaultfd copy failed with: {}", err),
-                    errno: Errno::UnknownErrno,
-                })?;
+            let copied = unsafe {
+                self.uffd.copy_with_wp(
+                    data.as_ptr() as *mut _,
+                    addr,
+                    length,
+                    true,
+                    access == SomePageAccess::ReadOnly,
+                )
+            }
+            .map_err(|err| AddrSpaceError::RuntimeError {
+                msg: format!("userfaultfd copy failed with: {}", err),
+                errno: Errno::UnknownErrno,
+            })?;
             assert_eq!(copied, length);
         } else {
-            let zeroed = unsafe { self.uffd.zeropage(addr, length, true) }.map_err(|err| {
-                AddrSpaceError::RuntimeError {
-                    msg: format!("userfaultfd zeropage failed with: {}", err),
-                    errno: Errno::UnknownErrno,
+            match access {
+                SomePageAccess::ReadOnly => {
+                    // `zeropage` doesn't have WP mode. Copy instead.
+                    let zeros = unsafe {
+                        nix::sys::mman::mmap_anonymous(
+                            None,
+                            range.len(),
+                            ProtFlags::PROT_READ,
+                            MapFlags::MAP_PRIVATE,
+                        )
+                        .map_err(|errno| AddrSpaceError::RuntimeError {
+                            msg: "mmap failed creating zeroed buffer".into(),
+                            errno,
+                        })
+                    }?;
+                    let zeros = unsafe { MmapGuard::from_raw(zeros, range.len()) };
+                    let copied = unsafe {
+                        self.uffd
+                            .copy_with_wp(zeros.addr().as_ptr(), addr, length, true, true)
+                    }
+                    .map_err(|err| AddrSpaceError::RuntimeError {
+                        msg: format!("userfaultfd copy failed with: {}", err),
+                        errno: Errno::UnknownErrno,
+                    })?;
+                    assert_eq!(copied, length);
                 }
-            })?;
-            assert_eq!(zeroed, length);
+                SomePageAccess::ReadWrite => {
+                    let zeroed =
+                        unsafe { self.uffd.zeropage(addr, length, true) }.map_err(|err| {
+                            AddrSpaceError::RuntimeError {
+                                msg: format!("userfaultfd zeropage failed with: {}", err),
+                                errno: Errno::UnknownErrno,
+                            }
+                        })?;
+                    assert_eq!(zeroed, length);
+                }
+            }
         }
         self.pages.insert(
             range.clone(),
@@ -655,7 +693,13 @@ impl Drop for AddrSpace {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::RwLock, thread};
+    use std::{
+        sync::{
+            RwLock,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+    };
 
     use crate::interceptmem::{addr_space::util::MmapGuard, page_addr::PAGE_SIZE};
 
@@ -699,11 +743,16 @@ mod tests {
         let (addrspace, mut engine) = AddrSpace::new(true).unwrap();
         let addrspace = Arc::new(RwLock::new(addrspace));
 
+        let fault_counter = Arc::new(AtomicUsize::new(0));
+
         let addrspace_weak = Arc::downgrade(&addrspace);
+        let fault_counter_clone = fault_counter.clone();
         let engine_thread = thread::spawn(move || {
             engine
                 .run(|pagefault| {
                     println!("Got {:?}", pagefault);
+                    let fault_counter = fault_counter_clone.fetch_add(1, Ordering::Relaxed);
+
                     let addrspace = if let Some(addrspace) = addrspace_weak.upgrade() {
                         addrspace
                     } else {
@@ -714,12 +763,18 @@ mod tests {
                     let addr =
                         PageAddr::containing_page(NonNull::new(pagefault.addr).unwrap()).unwrap();
                     let range = addr.enclosing_range(NonZeroUsize::new(1).unwrap()).unwrap();
-                    let data: [u8; PAGE_SIZE] = [42; PAGE_SIZE];
-                    addrspace
-                        .write()
-                        .unwrap()
-                        .give_access(&range, SomePageAccess::ReadWrite, Some(&data))
-                        .unwrap();
+
+                    match fault_counter {
+                        0 => {
+                            let data: [u8; PAGE_SIZE] = [42; PAGE_SIZE];
+                            addrspace
+                                .write()
+                                .unwrap()
+                                .give_access(&range, SomePageAccess::ReadWrite, Some(&data))
+                                .unwrap();
+                        }
+                        _ => panic!("shouldn't have happened"),
+                    }
                     Ok(())
                 })
                 .unwrap();
@@ -747,5 +802,6 @@ mod tests {
 
         drop(addrspace);
         engine_thread.join().unwrap();
+        assert_eq!(fault_counter.load(Ordering::Relaxed), 1);
     }
 }
