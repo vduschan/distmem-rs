@@ -112,10 +112,7 @@ impl AddrSpace {
             required_ioctls,
             pages: Default::default(),
         };
-        let fault_receiver = AddrSpaceEngine {
-            alive: alive_rx,
-            uffd,
-        };
+        let fault_receiver = AddrSpaceEngine { alive: alive_rx, uffd };
         Ok((addrspace, fault_receiver))
     }
 
@@ -127,25 +124,18 @@ impl AddrSpace {
     /// otherwise returns an error.
     #[allow(dead_code)]
     pub fn reserve_any(&mut self, length: NonZeroUsize) -> Result<Range<PageAddr>, AddrSpaceError> {
-        let mmapped = unsafe {
-            nix::sys::mman::mmap_anonymous(
-                None,
-                length,
-                ProtFlags::PROT_NONE,
-                MapFlags::MAP_PRIVATE,
-            )
-        }
-        .map_err(|errno| AddrSpaceError::RuntimeError {
-            msg: format!("mmap_anonymous(len: {}) failed", length),
-            errno,
-        })?;
+        let mmapped =
+            unsafe { nix::sys::mman::mmap_anonymous(None, length, ProtFlags::PROT_NONE, MapFlags::MAP_PRIVATE) }
+                .map_err(|errno| AddrSpaceError::RuntimeError {
+                    msg: format!("mmap_anonymous(len: {}) failed", length),
+                    errno,
+                })?;
         let mmapped = unsafe { util::MmapGuard::from_raw(mmapped, length) };
 
-        let reserved = PageAddr::try_from(mmapped.addr())
-            .expect("mmap_anonymous should've returned a page address");
-        let reserved = reserved.enclosing_range(mmapped.length()).expect(
-            "mmap_anonymous should've returned pages that can be represented by the PageAddr",
-        );
+        let reserved = PageAddr::try_from(mmapped.addr()).expect("mmap_anonymous should've returned a page address");
+        let reserved = reserved
+            .enclosing_range(mmapped.length())
+            .expect("mmap_anonymous should've returned pages that can be represented by the PageAddr");
 
         assert!(!self.pages.overlaps(&reserved));
         self.pages.insert(reserved.clone(), None);
@@ -167,9 +157,7 @@ impl AddrSpace {
         }
 
         let addr: NonNull<c_void> = range.start.into();
-        let addr: NonZeroUsize = (addr.as_ptr() as usize)
-            .try_into()
-            .expect("non-null ptr is non-0");
+        let addr: NonZeroUsize = (addr.as_ptr() as usize).try_into().expect("non-null ptr is non-0");
         let length = range.len();
         let mmapped = unsafe {
             nix::sys::mman::mmap_anonymous(
@@ -185,11 +173,10 @@ impl AddrSpace {
         })?;
         let mmapped = unsafe { util::MmapGuard::from_raw(mmapped, length) };
 
-        let reserved = PageAddr::try_from(mmapped.addr())
-            .expect("mmap_anonymous should've returned a page address");
-        let reserved = reserved.enclosing_range(mmapped.length()).expect(
-            "mmap_anonymous should've returned pages that can be represented by the PageAddr",
-        );
+        let reserved = PageAddr::try_from(mmapped.addr()).expect("mmap_anonymous should've returned a page address");
+        let reserved = reserved
+            .enclosing_range(mmapped.length())
+            .expect("mmap_anonymous should've returned pages that can be represented by the PageAddr");
 
         self.pages.insert(reserved, None);
         mmapped.consume();
@@ -248,8 +235,7 @@ impl AddrSpace {
     ) -> Result<Range<PageAddr>, AddrSpaceError> {
         if flags.contains(MapFlags::MAP_FIXED) || flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
             return Err(AddrSpaceError::InvalidFlags {
-                msg: "MAP_FIXED and MAP_FIXED_NOREPLACE flags invalid without specified range"
-                    .into(),
+                msg: "MAP_FIXED and MAP_FIXED_NOREPLACE flags invalid without specified range".into(),
             });
         }
 
@@ -324,23 +310,18 @@ impl AddrSpace {
             })?;
         assert!(supported_ioctls.contains(self.required_ioctls));
         // Ensure that `mmapped` is protected by userfaultfd
-        unsafe {
-            nix::sys::mman::madvise(
-                mmapped.addr(),
-                mmapped.length().get(),
-                MmapAdvise::MADV_DONTNEED,
-            )
-        }
-        .map_err(|errno| AddrSpaceError::RuntimeError {
-            msg: "madvise failed dropping the pages".into(),
-            errno,
-        })?;
-        unsafe { nix::sys::mman::mprotect(mmapped.addr(), mmapped.length().get(), prot) }.map_err(
+        unsafe { nix::sys::mman::madvise(mmapped.addr(), mmapped.length().get(), MmapAdvise::MADV_DONTNEED) }.map_err(
             |errno| AddrSpaceError::RuntimeError {
-                msg: "mprotect failed applying the desired prot".into(),
+                msg: "madvise failed dropping the pages".into(),
                 errno,
             },
         )?;
+        unsafe { nix::sys::mman::mprotect(mmapped.addr(), mmapped.length().get(), prot) }.map_err(|errno| {
+            AddrSpaceError::RuntimeError {
+                msg: "mprotect failed applying the desired prot".into(),
+                errno,
+            }
+        })?;
 
         // Try to move `mmapped` pages to the specified `range`.
         if self.is_free(range) || (flags.contains(MapFlags::MAP_FIXED) && self.is_reserved(range)) {
@@ -359,8 +340,7 @@ impl AddrSpace {
             })?;
             assert_eq!(mremaped, range.start.into());
             let _ = mmapped.consume(); // `self` now owns this range
-            self.pages
-                .insert(range.clone(), PageState { access: None }.into());
+            self.pages.insert(range.clone(), PageState { access: None }.into());
             return Ok(range.clone());
         }
 
@@ -421,13 +401,9 @@ impl AddrSpace {
         // Check if range is valid to give it access
         match self.pages.get_key_value(&range.start) {
             Some((reserved, Some(state))) => {
-                if reserved.start > range.start
-                    || reserved.end < range.end
-                    || state.access.is_some()
-                {
+                if reserved.start > range.start || reserved.end < range.end || state.access.is_some() {
                     return Err(AddrSpaceError::InvalidRange {
-                        msg: "part of the range not reserved, not mapped or already has access"
-                            .into(),
+                        msg: "part of the range not reserved, not mapped or already has access".into(),
                     });
                 }
             }
@@ -465,46 +441,33 @@ impl AddrSpace {
                 SomePageAccess::ReadOnly => {
                     // `zeropage` doesn't have WP mode. Copy instead.
                     let zeros = unsafe {
-                        nix::sys::mman::mmap_anonymous(
-                            None,
-                            range.len(),
-                            ProtFlags::PROT_READ,
-                            MapFlags::MAP_PRIVATE,
-                        )
-                        .map_err(|errno| AddrSpaceError::RuntimeError {
-                            msg: "mmap failed creating zeroed buffer".into(),
-                            errno,
-                        })
+                        nix::sys::mman::mmap_anonymous(None, range.len(), ProtFlags::PROT_READ, MapFlags::MAP_PRIVATE)
+                            .map_err(|errno| AddrSpaceError::RuntimeError {
+                                msg: "mmap failed creating zeroed buffer".into(),
+                                errno,
+                            })
                     }?;
                     let zeros = unsafe { MmapGuard::from_raw(zeros, range.len()) };
-                    let copied = unsafe {
-                        self.uffd
-                            .copy_with_wp(zeros.addr().as_ptr(), addr, length, true, true)
-                    }
-                    .map_err(|err| AddrSpaceError::RuntimeError {
-                        msg: format!("userfaultfd copy failed with: {}", err),
-                        errno: Errno::UnknownErrno,
-                    })?;
+                    let copied = unsafe { self.uffd.copy_with_wp(zeros.addr().as_ptr(), addr, length, true, true) }
+                        .map_err(|err| AddrSpaceError::RuntimeError {
+                            msg: format!("userfaultfd copy failed with: {}", err),
+                            errno: Errno::UnknownErrno,
+                        })?;
                     assert_eq!(copied, length);
                 }
                 SomePageAccess::ReadWrite => {
-                    let zeroed =
-                        unsafe { self.uffd.zeropage(addr, length, true) }.map_err(|err| {
-                            AddrSpaceError::RuntimeError {
-                                msg: format!("userfaultfd zeropage failed with: {}", err),
-                                errno: Errno::UnknownErrno,
-                            }
-                        })?;
+                    let zeroed = unsafe { self.uffd.zeropage(addr, length, true) }.map_err(|err| {
+                        AddrSpaceError::RuntimeError {
+                            msg: format!("userfaultfd zeropage failed with: {}", err),
+                            errno: Errno::UnknownErrno,
+                        }
+                    })?;
                     assert_eq!(zeroed, length);
                 }
             }
         }
-        self.pages.insert(
-            range.clone(),
-            Some(PageState {
-                access: Some(access),
-            }),
-        );
+        self.pages
+            .insert(range.clone(), Some(PageState { access: Some(access) }));
         Ok(())
     }
 
@@ -514,11 +477,7 @@ impl AddrSpace {
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn update_access(
-        &mut self,
-        _range: &Range<PageAddr>,
-        _access: SomePageAccess,
-    ) -> Result<(), AddrSpaceError> {
+    pub fn update_access(&mut self, _range: &Range<PageAddr>, _access: SomePageAccess) -> Result<(), AddrSpaceError> {
         todo!()
     }
 
@@ -601,12 +560,13 @@ impl AddrSpaceEngine {
                 }
             }
 
-            let events = self.uffd.read_events(&mut events_buf).map_err(|err| {
-                AddrSpaceEngineError::RuntimeError {
+            let events = self
+                .uffd
+                .read_events(&mut events_buf)
+                .map_err(|err| AddrSpaceEngineError::RuntimeError {
                     msg: format!("userfaultfd failed during event read: {}", err),
                     errno: Errno::UnknownErrno,
-                }
-            })?;
+                })?;
             for event in events {
                 let event = event.map_err(|err| AddrSpaceEngineError::RuntimeError {
                     msg: format!("userfaultfd event error: {}", err),
@@ -653,27 +613,20 @@ mod util {
             Self(Some((addr, length)))
         }
         pub fn addr(&self) -> NonNull<c_void> {
-            self.0
-                .expect("invariant: inner data is Some until consumed")
-                .0
+            self.0.expect("invariant: inner data is Some until consumed").0
         }
         pub fn length(&self) -> NonZeroUsize {
-            self.0
-                .expect("invariant: inner data is Some until consumed")
-                .1
+            self.0.expect("invariant: inner data is Some until consumed").1
         }
         pub fn consume(mut self) -> (NonNull<c_void>, NonZeroUsize) {
-            self.0
-                .take()
-                .expect("invariant: inner data is Some until consumed")
+            self.0.take().expect("invariant: inner data is Some until consumed")
         }
     }
     impl Drop for MmapGuard {
         fn drop(&mut self) {
             if let Some((addr, length)) = self.0 {
                 unsafe {
-                    nix::sys::mman::munmap(addr, length.get())
-                        .expect("munmap should've succeeded on mmapped range")
+                    nix::sys::mman::munmap(addr, length.get()).expect("munmap should've succeeded on mmapped range")
                 };
             }
         }
@@ -760,8 +713,7 @@ mod tests {
                         return Ok(());
                     };
 
-                    let addr =
-                        PageAddr::containing_page(NonNull::new(pagefault.addr).unwrap()).unwrap();
+                    let addr = PageAddr::containing_page(NonNull::new(pagefault.addr).unwrap()).unwrap();
                     let range = addr.enclosing_range(NonZeroUsize::new(1).unwrap()).unwrap();
 
                     match fault_counter {

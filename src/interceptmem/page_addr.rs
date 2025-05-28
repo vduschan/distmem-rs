@@ -107,10 +107,7 @@ mod tests {
         let length = NonZeroUsize::new(PAGE_SIZE + 1).unwrap();
         let range = addr.enclosing_range(length).unwrap();
         assert_eq!(range.start, addr);
-        assert_eq!(
-            range.end,
-            PageAddr(NonZeroUsize::new(44 * PAGE_SIZE).unwrap())
-        );
+        assert_eq!(range.end, PageAddr(NonZeroUsize::new(44 * PAGE_SIZE).unwrap()));
     }
 
     #[test]

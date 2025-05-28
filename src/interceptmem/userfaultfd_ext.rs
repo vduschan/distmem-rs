@@ -4,8 +4,8 @@ use std::{
 };
 
 use linux_raw_sys::general::{
-    _UFFDIO_API, _UFFDIO_COPY, UFFD_API, UFFD_USER_MODE_ONLY, UFFDIO, UFFDIO_COPY_MODE_DONTWAKE,
-    UFFDIO_COPY_MODE_WP, uffdio_api, uffdio_copy,
+    _UFFDIO_API, _UFFDIO_COPY, UFFD_API, UFFD_USER_MODE_ONLY, UFFDIO, UFFDIO_COPY_MODE_DONTWAKE, UFFDIO_COPY_MODE_WP,
+    uffdio_api, uffdio_copy,
 };
 use nix::{
     errno::Errno,
@@ -27,10 +27,7 @@ fn syscall_userfaultfd(flags: c_int) -> Result<OwnedFd, Errno> {
 }
 
 nix::ioctl_readwrite!(ioctl_uffdio_api_raw, UFFDIO, _UFFDIO_API, uffdio_api);
-unsafe fn ioctl_uffdio_api(
-    fd: BorrowedFd,
-    features: uffd::FeatureFlags,
-) -> Result<uffd::IoctlFlags, Errno> {
+unsafe fn ioctl_uffdio_api(fd: BorrowedFd, features: uffd::FeatureFlags) -> Result<uffd::IoctlFlags, Errno> {
     let mut arg = uffdio_api {
         api: UFFD_API as _,
         features: features.bits(),
