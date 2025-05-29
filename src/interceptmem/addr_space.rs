@@ -225,6 +225,10 @@ impl AddrSpace {
         self.get_state(range).is_some_and(|state| *state == PageState::Free)
     }
 
+    fn is_mapped(&self, range: &Range<PageAddr>) -> bool {
+        self.get_state(range).is_some_and(|state| *state == PageState::Mapped)
+    }
+
     fn get_access(&self, range: &Range<PageAddr>) -> Option<&PageAccess> {
         let (pages, access) = self.access.get_key_value(&range.start)?;
         if pages.encloses(range) { Some(access) } else { None }
@@ -232,6 +236,10 @@ impl AddrSpace {
 
     fn has_none_access(&self, range: &Range<PageAddr>) -> bool {
         self.get_access(range).is_some_and(|access| access.is_none())
+    }
+
+    fn has_some_access(&self, range: &Range<PageAddr>) -> bool {
+        self.is_mapped(range) && self.access.overlapping(range).all(|(_pages, access)| access.is_some())
     }
 
     /// Maps a previously reserved range of pages of the specified length as anonymous memory.
@@ -497,8 +505,21 @@ impl AddrSpace {
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn take_access(&mut self, _range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
-        todo!();
+    pub fn take_access(&mut self, range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
+        if !self.has_some_access(range) {
+            return Err(AddrSpaceError::InvalidRange {
+                msg: "part of the range doesn't have access".into(),
+            });
+        }
+
+        unsafe { nix::sys::mman::madvise(range.start.into(), range.len().get(), MmapAdvise::MADV_DONTNEED) }.map_err(
+            |errno| AddrSpaceError::RuntimeError {
+                msg: "madvise failed dropping the pages".into(),
+                errno,
+            },
+        )?;
+        self.access.insert(range.clone(), None);
+        Ok(())
     }
 }
 
