@@ -22,6 +22,7 @@ use crate::interceptmem::userfaultfd_ext::UffdExt;
 
 use super::{
     page_addr::{PageAddr, RangeExtLen},
+    range_ext::RangeExtOps,
     userfaultfd_ext::{UserfaultFdFlags, userfaultfd_create},
 };
 
@@ -196,7 +197,12 @@ impl AddrSpace {
     fn find_free(&self, length: NonZeroUsize) -> Option<Range<PageAddr>> {
         self.pages.iter().find_map(|(reserved, state)| {
             if reserved.len() >= length && state.is_none() {
-                Some(reserved.clone())
+                Some(
+                    reserved
+                        .start
+                        .enclosing_range(length)
+                        .expect("enclosing range should fit into reserved"),
+                )
             } else {
                 None
             }
@@ -205,7 +211,7 @@ impl AddrSpace {
 
     fn is_free(&self, range: &Range<PageAddr>) -> bool {
         if let Some((reserved, state)) = self.pages.get_key_value(&range.start) {
-            state.is_none() && reserved.start <= range.start && reserved.end >= range.end
+            state.is_none() && reserved.encloses(range)
         } else {
             false
         }
@@ -401,7 +407,7 @@ impl AddrSpace {
         // Check if range is valid to give it access
         match self.pages.get_key_value(&range.start) {
             Some((reserved, Some(state))) => {
-                if reserved.start > range.start || reserved.end < range.end || state.access.is_some() {
+                if !reserved.encloses(range) || state.access.is_some() {
                     return Err(AddrSpaceError::InvalidRange {
                         msg: "part of the range not reserved, not mapped or already has access".into(),
                     });
