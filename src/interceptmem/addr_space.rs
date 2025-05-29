@@ -242,6 +242,22 @@ impl AddrSpace {
         self.is_mapped(range) && self.access.overlapping(range).all(|(_pages, access)| access.is_some())
     }
 
+    fn has_ro_access(&self, range: &Range<PageAddr>) -> bool {
+        self.is_mapped(range)
+            && self
+                .access
+                .overlapping(range)
+                .all(|(_pages, access)| *access == Some(SomePageAccess::ReadOnly))
+    }
+
+    fn has_rw_access(&self, range: &Range<PageAddr>) -> bool {
+        self.is_mapped(range)
+            && self
+                .access
+                .overlapping(range)
+                .all(|(_pages, access)| *access == Some(SomePageAccess::ReadWrite))
+    }
+
     /// Maps a previously reserved range of pages of the specified length as anonymous memory.
     ///
     /// # Warning
@@ -484,14 +500,46 @@ impl AddrSpace {
         Ok(())
     }
 
-    /// Updates access to a previously mapped range of pages that has some access.
+    /// Upgrades access from a previously mapped range of pages that has
+    /// `SomePageAccess::ReadOnly` access into `SomePageAccess::ReadWrite`.
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn update_access(&mut self, _range: &Range<PageAddr>, _access: SomePageAccess) -> Result<(), AddrSpaceError> {
-        todo!()
+    pub fn upgrade_access(&mut self, range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
+        if !self.has_ro_access(range) {
+            return Err(AddrSpaceError::InvalidRange {
+                msg: "part of the range doesn't have RO access".into(),
+            });
+        }
+        self.uffd
+            .remove_write_protection(NonNull::from(range.start).as_ptr(), range.len().get(), true)
+            .map_err(|err| AddrSpaceError::RuntimeError {
+                msg: format!("userfaultfd remove_write_protection failed with: {}", err),
+                errno: Errno::UnknownErrno,
+            })
+    }
+
+    /// Downgrades access from a previously mapped range of pages that has
+    /// `SomePageAccess::ReadWrite` access into `SomePageAccess::ReadOnly`.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if successful, otherwise returns an error.
+    #[allow(dead_code)]
+    pub fn downgrade_access(&mut self, range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
+        if !self.has_rw_access(range) {
+            return Err(AddrSpaceError::InvalidRange {
+                msg: "part of the range doesn't have RW access".into(),
+            });
+        }
+        self.uffd
+            .write_protect(NonNull::from(range.start).as_ptr(), range.len().get())
+            .map_err(|err| AddrSpaceError::RuntimeError {
+                msg: format!("userfaultfd write_protect failed with: {}", err),
+                errno: Errno::UnknownErrno,
+            })
     }
 
     /// Takes the access from a previously mapped range of pages that has some access.
@@ -744,12 +792,17 @@ mod tests {
 
                     match fault_counter {
                         0 => {
+                            assert_eq!(pagefault.access, SomePageAccess::ReadOnly);
                             let data: [u8; PAGE_SIZE] = [42; PAGE_SIZE];
                             addrspace
                                 .write()
                                 .unwrap()
-                                .give_access(&range, SomePageAccess::ReadWrite, Some(&data))
+                                .give_access(&range, SomePageAccess::ReadOnly, Some(&data))
                                 .unwrap();
+                        }
+                        1 => {
+                            assert_eq!(pagefault.access, SomePageAccess::ReadWrite);
+                            addrspace.write().unwrap().upgrade_access(&range).unwrap();
                         }
                         _ => panic!("shouldn't have happened"),
                     }
@@ -775,11 +828,13 @@ mod tests {
         assert_eq!(reserved, mmapped);
 
         let val_ptr = NonNull::from(mmapped.start).as_ptr() as *mut u8;
-        let val = unsafe { *(val_ptr) };
+        let val = unsafe { *(val_ptr) }; // 1st pagefault
         assert_eq!(val, 42);
+
+        unsafe { *(val_ptr) = 13 }; // 2nd pagefault
 
         drop(addrspace);
         engine_thread.join().unwrap();
-        assert_eq!(fault_counter.load(Ordering::Relaxed), 1);
+        assert_eq!(fault_counter.load(Ordering::Relaxed), 2);
     }
 }
