@@ -518,7 +518,9 @@ impl AddrSpace {
             .map_err(|err| AddrSpaceError::RuntimeError {
                 msg: format!("userfaultfd remove_write_protection failed with: {}", err),
                 errno: Errno::UnknownErrno,
-            })
+            })?;
+        self.access.insert(range.clone(), Some(SomePageAccess::ReadWrite));
+        Ok(())
     }
 
     /// Downgrades access from a previously mapped range of pages that has
@@ -539,7 +541,9 @@ impl AddrSpace {
             .map_err(|err| AddrSpaceError::RuntimeError {
                 msg: format!("userfaultfd write_protect failed with: {}", err),
                 errno: Errno::UnknownErrno,
-            })
+            })?;
+        self.access.insert(range.clone(), Some(SomePageAccess::ReadOnly));
+        Ok(())
     }
 
     /// Takes the access from a previously mapped range of pages that has some access.
@@ -816,9 +820,22 @@ mod tests {
     }
 
     #[test]
-    fn test_addr_space_mmap_any() {
+    fn test_addr_space_pagefaults() {
         let (addrspace, mut engine) = AddrSpace::new(true).unwrap();
         let addrspace = Arc::new(RwLock::new(addrspace));
+
+        let reserved = addrspace
+            .write()
+            .unwrap()
+            .reserve_any((2 * PAGE_SIZE).try_into().unwrap())
+            .unwrap();
+
+        let page_0_addr = reserved.start;
+        let page_1_addr = reserved
+            .start
+            .enclosing_range(PAGE_SIZE.try_into().unwrap())
+            .unwrap()
+            .end;
 
         let fault_counter = Arc::new(AtomicUsize::new(0));
 
@@ -842,6 +859,7 @@ mod tests {
 
                     match fault_counter {
                         0 => {
+                            assert_eq!(addr, page_0_addr);
                             assert_eq!(pagefault.access, SomePageAccess::ReadOnly);
                             let data: [u8; PAGE_SIZE] = [42; PAGE_SIZE];
                             addrspace
@@ -851,9 +869,46 @@ mod tests {
                                 .unwrap();
                         }
                         1 => {
+                            assert_eq!(addr, page_0_addr);
                             assert_eq!(pagefault.access, SomePageAccess::ReadWrite);
                             addrspace.write().unwrap().upgrade_access(&range).unwrap();
                         }
+                        2 => {
+                            assert_eq!(addr, page_1_addr);
+                            assert_eq!(pagefault.access, SomePageAccess::ReadOnly);
+                            addrspace
+                                .write()
+                                .unwrap()
+                                .take_access(&page_0_addr.enclosing_range(PAGE_SIZE.try_into().unwrap()).unwrap())
+                                .unwrap();
+                            let data: [u8; PAGE_SIZE] = [11; PAGE_SIZE];
+                            addrspace
+                                .write()
+                                .unwrap()
+                                .give_access(&range, SomePageAccess::ReadWrite, Some(&data))
+                                .unwrap();
+                        }
+                        3 => {
+                            assert_eq!(addr, page_0_addr);
+                            assert_eq!(pagefault.access, SomePageAccess::ReadOnly);
+                            addrspace
+                                .write()
+                                .unwrap()
+                                .downgrade_access(&page_1_addr.enclosing_range(PAGE_SIZE.try_into().unwrap()).unwrap())
+                                .unwrap();
+                            let data: [u8; PAGE_SIZE] = [17; PAGE_SIZE];
+                            addrspace
+                                .write()
+                                .unwrap()
+                                .give_access(&range, SomePageAccess::ReadOnly, Some(&data))
+                                .unwrap();
+                        }
+                        4 => {
+                            assert_eq!(addr, page_1_addr);
+                            assert_eq!(pagefault.access, SomePageAccess::ReadWrite);
+                            addrspace.write().unwrap().upgrade_access(&range).unwrap();
+                        }
+
                         _ => panic!("shouldn't have happened"),
                     }
                     Ok(())
@@ -861,11 +916,6 @@ mod tests {
                 .unwrap();
         });
 
-        let reserved = addrspace
-            .write()
-            .unwrap()
-            .reserve_any((10 * PAGE_SIZE).try_into().unwrap())
-            .unwrap();
         let mmapped = addrspace
             .write()
             .unwrap()
@@ -877,14 +927,38 @@ mod tests {
             .unwrap();
         assert_eq!(reserved, mmapped);
 
-        let val_ptr = NonNull::from(mmapped.start).as_ptr() as *mut u8;
-        let val = unsafe { *(val_ptr) }; // 1st pagefault
-        assert_eq!(val, 42);
+        let page_0_ptr = NonNull::from(mmapped.start).as_ptr() as *mut u8;
+        let page_1_ptr = unsafe { page_0_ptr.add(PAGE_SIZE) };
 
-        unsafe { *(val_ptr) = 13 }; // 2nd pagefault
+        {
+            let page_0_val = unsafe { *(page_0_ptr) }; // 1st pagefault - page_0 RO access
+            // engine_thread gives RO access to page_0
+            assert_eq!(page_0_val, 42);
+        }
+        {
+            unsafe { *(page_0_ptr) = 13 }; // 2nd pagefault - page_0 RW access
+            // engine_thread upgrades page_0 access to RW
+        }
+        {
+            let page_1_val = unsafe { *(page_1_ptr) }; // 3rd pagefault - page_1 RO access
+            // engine_thread takes access from page_0
+            // engine_thread gives RW access to page_1
+            assert_eq!(page_1_val, 11);
+            unsafe { *(page_1_ptr) = 19 };
+        }
+        {
+            let page_0_val = unsafe { *(page_0_ptr) }; // 4th pagefault - page_0 RO access
+            // engine_thread downgrades page_1 access to RO
+            // engine_thread gives RO access to page_0
+            assert_eq!(page_0_val, 17);
+        }
+        {
+            unsafe { *(page_1_ptr) = 7 }; // 5th pagefault - page_1 RW access
+            // engine_thread upgrades page_1 access to RW
+        }
 
         drop(addrspace);
         engine_thread.join().unwrap();
-        assert_eq!(fault_counter.load(Ordering::Relaxed), 2);
+        assert_eq!(fault_counter.load(Ordering::Relaxed), 5);
     }
 }
