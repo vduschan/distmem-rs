@@ -54,11 +54,11 @@ impl PageAddr {
 }
 
 #[allow(dead_code)]
-pub trait RangeExt {
+pub trait RangeExtLen {
     fn len(&self) -> NonZeroUsize;
 }
 
-impl RangeExt for Range<PageAddr> {
+impl RangeExtLen for Range<PageAddr> {
     fn len(&self) -> NonZeroUsize {
         let length = self
             .end

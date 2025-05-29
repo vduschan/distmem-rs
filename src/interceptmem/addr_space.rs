@@ -21,7 +21,7 @@ use util::MmapGuard;
 use crate::interceptmem::userfaultfd_ext::UffdExt;
 
 use super::{
-    page_addr::{PageAddr, RangeExt},
+    page_addr::{PageAddr, RangeExtLen},
     userfaultfd_ext::{UserfaultFdFlags, userfaultfd_create},
 };
 

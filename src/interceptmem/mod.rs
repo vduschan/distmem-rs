@@ -2,4 +2,5 @@
 /// access can be controlled and intercepted.
 pub mod addr_space;
 pub mod page_addr;
+mod range_ext;
 mod userfaultfd_ext;
