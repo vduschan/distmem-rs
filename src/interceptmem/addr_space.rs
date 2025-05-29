@@ -21,7 +21,7 @@ use util::MmapGuard;
 use crate::interceptmem::userfaultfd_ext::UffdExt;
 
 use super::{
-    page_addr::{PageAddr, RangeExtLen},
+    page_addr::{PAGE_SIZE, PageAddr, RangeExtLen},
     range_ext::RangeExtOps,
     userfaultfd_ext::{UserfaultFdFlags, userfaultfd_create},
 };
@@ -42,7 +42,7 @@ enum PageState {
     Mapped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(dead_code)]
 pub enum SomePageAccess {
     ReadOnly,
@@ -568,6 +568,56 @@ impl AddrSpace {
         )?;
         self.access.insert(range.clone(), None);
         Ok(())
+    }
+
+    /// Consumes pagefault causing the blocked thread to retry the access that
+    /// caused the pagefault.
+    ///
+    /// This comes handy if `AddrSpace` has changed after the pagefault has
+    /// happened, but before it has been handled.
+    /// For example:
+    /// 1. thread_a causes a pagefault
+    /// 2. pagefault handler receives the thread_a pagefault
+    /// 3. thread_b causes the same pagefault
+    /// 4. pagefault handler handles thread_a pagefault
+    /// 5. pagefault handler receives the thread_b pagefault => fault is already
+    ///    handled, just consume it
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if successful, otherwise returns an error.
+    #[allow(dead_code)]
+    pub fn consume_pagefault(&self, pagefault: PageFault) -> Result<(), AddrSpaceError> {
+        let addr = if let Some(addr) = NonNull::new(pagefault.addr) {
+            addr
+        } else {
+            return Err(AddrSpaceError::InvalidRange {
+                msg: "pagefault address NULL is invalid".into(),
+            });
+        };
+        let addr = if let Some(addr) = PageAddr::containing_page(addr) {
+            addr
+        } else {
+            return Err(AddrSpaceError::InvalidRange {
+                msg: "pagefault address is invalid".into(),
+            });
+        };
+
+        // If `access` is `None`, it means that `addr` points to the free page.
+        // Such access won't cause UFFD pagefault, but raise SIGSEGV - that's fine.
+        if let Some(access) = self.access.get(&addr) {
+            if *access < Some(pagefault.access) {
+                return Err(AddrSpaceError::InvalidRange {
+                    msg: "pagefault shouldn't be consumed".into(),
+                });
+            }
+        }
+        self.uffd
+            .wake(NonNull::from(addr).as_ptr(), PAGE_SIZE)
+            .map_err(|err| AddrSpaceError::RuntimeError {
+                msg: format!("userfaultfd wake failed with: {}", err),
+                errno: Errno::UnknownErrno,
+            })
     }
 }
 
