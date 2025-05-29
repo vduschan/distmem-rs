@@ -1,5 +1,6 @@
 use std::{
     ffi::c_void,
+    mem::transmute,
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
 };
 
@@ -108,7 +109,7 @@ impl UffdExt for Uffd {
         len: usize,
         wake: bool,
         writeprotect: bool,
-    ) -> userfaultfd::Result<usize> {
+    ) -> uffd::Result<usize> {
         let mut mode: c_int = 0;
         if !wake {
             mode |= UFFDIO_COPY_MODE_DONTWAKE as c_int;
@@ -124,8 +125,16 @@ impl UffdExt for Uffd {
             mode: mode as _,
             copy: 0,
         };
-        let ret = unsafe { ioctl_uffdio_copy_raw(self.as_raw_fd(), &mut arg as *mut _) }.unwrap();
+        // `Errno` used in `userfaultfd` crate is not public => annotations couldn't be added.
+        #[allow(clippy::missing_transmute_annotations)]
+        let ret = unsafe { ioctl_uffdio_copy_raw(self.as_raw_fd(), &mut arg as *mut _) }
+            .map_err(|errno| uffd::Error::CopyFailed(unsafe { transmute(errno) }))?;
         assert!(ret == 0);
-        Ok(arg.copy as usize)
+        assert!(arg.copy > 0);
+        if len > arg.copy as _ {
+            Err(uffd::Error::PartiallyCopied(arg.copy as usize))
+        } else {
+            Ok(arg.copy as usize)
+        }
     }
 }
