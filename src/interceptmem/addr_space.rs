@@ -411,8 +411,26 @@ impl AddrSpace {
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn unmap(&mut self, _range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
-        todo!()
+    pub fn unmap(&mut self, range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
+        let to_unmap = RangeMap::from_iter(
+            self.pages
+                .overlapping(range)
+                .map(|(pages, _state)| (pages.intersection(range), ())),
+        );
+        for (range, _) in to_unmap {
+            unsafe {
+                nix::sys::mman::mmap_anonymous(
+                    Some(NonZeroUsize::new(NonNull::from(range.start).as_ptr() as usize).unwrap()),
+                    range.len(),
+                    ProtFlags::PROT_NONE,
+                    MapFlags::MAP_PRIVATE.union(MapFlags::MAP_FIXED),
+                )
+            }
+            .expect("shouldn't have failed, otherwise unrecoverable error");
+            self.pages.insert(range.clone(), PageState::Free);
+            self.access.remove(range);
+        }
+        Ok(())
     }
 
     /// Gives access to a previously mapped range of pages that doesn't have access.
@@ -799,7 +817,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_reserve() {
-        let mmapped = unsafe {
+        let mapped = unsafe {
             nix::sys::mman::mmap_anonymous(
                 None,
                 PAGE_SIZE.try_into().unwrap(),
@@ -808,15 +826,65 @@ mod tests {
             )
             .unwrap()
         };
-        let mmapped = unsafe { MmapGuard::from_raw(mmapped, PAGE_SIZE.try_into().unwrap()) };
-        let occupied: PageAddr = mmapped.addr().try_into().unwrap();
-        let occupied = occupied.enclosing_range(mmapped.length()).unwrap();
+        let mapped = unsafe { MmapGuard::from_raw(mapped, PAGE_SIZE.try_into().unwrap()) };
+        let occupied: PageAddr = mapped.addr().try_into().unwrap();
+        let occupied = occupied.enclosing_range(mapped.length()).unwrap();
 
         let (mut addrspace, _fault_receiver) = AddrSpace::new(true).unwrap();
 
-        // AddrSpace shouldn't reserve externally mmapped range
+        // AddrSpace shouldn't reserve externally mapped range
         let result = addrspace.reserve(&occupied);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_addr_space_map_unmap() {
+        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let engine_thread = thread::spawn(move || {
+            engine.run(|_pagefault| Ok(())).unwrap();
+        });
+
+        assert!(
+            addrspace
+                .map_anonymous_any(
+                    PAGE_SIZE.try_into().unwrap(),
+                    ProtFlags::PROT_NONE,
+                    MapFlags::MAP_PRIVATE
+                )
+                .is_err()
+        );
+
+        let reserved = addrspace.reserve_any(PAGE_SIZE.try_into().unwrap()).unwrap();
+        let mapped = addrspace
+            .map_anonymous_any(
+                PAGE_SIZE.try_into().unwrap(),
+                ProtFlags::PROT_NONE,
+                MapFlags::MAP_PRIVATE,
+            )
+            .unwrap();
+        assert_eq!(mapped, reserved);
+
+        {
+            let pages = Vec::from_iter(addrspace.pages.iter().map(|(pages, state)| (pages.clone(), *state)));
+            let pages_expected = [(mapped.clone(), PageState::Mapped)];
+            assert_eq!(pages, pages_expected);
+
+            let access = Vec::from_iter(addrspace.access.iter().map(|(pages, access)| (pages.clone(), *access)));
+            let access_expected = [(mapped.clone(), None::<SomePageAccess>)];
+            assert_eq!(access, access_expected);
+        }
+
+        addrspace.unmap(&mapped).unwrap();
+        {
+            let pages = Vec::from_iter(addrspace.pages.iter().map(|(pages, state)| (pages.clone(), *state)));
+            let pages_expected = [(mapped.clone(), PageState::Free)];
+            assert_eq!(pages, pages_expected);
+
+            assert!(addrspace.access.is_empty());
+        }
+
+        drop(addrspace);
+        engine_thread.join().unwrap();
     }
 
     #[test]
@@ -916,7 +984,7 @@ mod tests {
                 .unwrap();
         });
 
-        let mmapped = addrspace
+        let mapped = addrspace
             .write()
             .unwrap()
             .map_anonymous_any(
@@ -925,9 +993,9 @@ mod tests {
                 MapFlags::MAP_PRIVATE,
             )
             .unwrap();
-        assert_eq!(reserved, mmapped);
+        assert_eq!(reserved, mapped);
 
-        let page_0_ptr = NonNull::from(mmapped.start).as_ptr() as *mut u8;
+        let page_0_ptr = NonNull::from(mapped.start).as_ptr() as *mut u8;
         let page_1_ptr = unsafe { page_0_ptr.add(PAGE_SIZE) };
 
         {
