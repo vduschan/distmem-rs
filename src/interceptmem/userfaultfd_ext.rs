@@ -5,8 +5,8 @@ use std::{
 };
 
 use linux_raw_sys::general::{
-    _UFFDIO_API, _UFFDIO_COPY, UFFD_API, UFFD_USER_MODE_ONLY, UFFDIO, UFFDIO_COPY_MODE_DONTWAKE, UFFDIO_COPY_MODE_WP,
-    uffdio_api, uffdio_copy,
+    _UFFDIO_API, _UFFDIO_COPY, _UFFDIO_MOVE, UFFD_API, UFFD_USER_MODE_ONLY, UFFDIO, UFFDIO_COPY_MODE_DONTWAKE,
+    UFFDIO_COPY_MODE_WP, uffdio_api, uffdio_copy, uffdio_move,
 };
 use nix::{
     errno::Errno,
@@ -97,9 +97,13 @@ pub trait UffdExt {
         wake: bool,
         writeprotect: bool,
     ) -> uffd::Result<usize>;
+
+    #[allow(dead_code)]
+    unsafe fn mov(&self, src: *mut c_void, dst: *mut c_void, len: usize) -> uffd::Result<usize>;
 }
 
 nix::ioctl_readwrite!(ioctl_uffdio_copy_raw, UFFDIO, _UFFDIO_COPY, uffdio_copy);
+nix::ioctl_readwrite!(ioctl_uffdio_move_raw, UFFDIO, _UFFDIO_MOVE, uffdio_move);
 
 impl UffdExt for Uffd {
     unsafe fn copy_with_wp(
@@ -135,6 +139,27 @@ impl UffdExt for Uffd {
             Err(uffd::Error::PartiallyCopied(arg.copy as usize))
         } else {
             Ok(arg.copy as usize)
+        }
+    }
+
+    unsafe fn mov(&self, src: *mut c_void, dst: *mut c_void, len: usize) -> userfaultfd::Result<usize> {
+        let mut arg = uffdio_move {
+            dst: dst as _,
+            src: src as _,
+            len: len as _,
+            mode: 0,
+            move_: 0,
+        };
+        // `Errno` used in `userfaultfd` crate is not public => annotations couldn't be added.
+        #[allow(clippy::missing_transmute_annotations)]
+        let ret = unsafe { ioctl_uffdio_move_raw(self.as_raw_fd(), &mut arg as *mut _) }
+            .map_err(|errno| uffd::Error::CopyFailed(unsafe { transmute(errno) }))?;
+        assert!(ret == 0);
+        assert!(arg.move_ > 0);
+        if len > arg.move_ as _ {
+            Err(uffd::Error::PartiallyCopied(arg.move_ as usize))
+        } else {
+            Ok(arg.move_ as usize)
         }
     }
 }
