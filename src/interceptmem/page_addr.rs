@@ -1,5 +1,7 @@
 use std::{ffi::c_void, num::NonZeroUsize, ops::Range, ptr::NonNull};
 
+use thiserror::Error;
+
 #[allow(dead_code)]
 pub const PAGE_BITS: usize = 12;
 #[allow(dead_code)]
@@ -23,13 +25,21 @@ impl std::fmt::Display for PageAddr {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum PageAddrError {
+    #[error("Invalid pointer: {msg}")]
+    InvalidPointer { msg: String },
+}
+
 impl TryFrom<NonNull<c_void>> for PageAddr {
-    type Error = ();
+    type Error = PageAddrError;
 
     fn try_from(value: NonNull<c_void>) -> Result<Self, Self::Error> {
         let addr = NonZeroUsize::new(value.as_ptr() as usize).expect("non-null ptr is non-0");
         if addr.get() & !PAGE_MASK != 0 {
-            return Err(());
+            return Err(PageAddrError::InvalidPointer {
+                msg: "pointer points to the null page".into(),
+            });
         }
         Ok(PageAddr(addr))
     }
