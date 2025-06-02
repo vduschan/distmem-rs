@@ -446,6 +446,26 @@ impl AddrSpace {
         Ok(())
     }
 
+    /// Protects a previously mapped range of pages.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if successful, otherwise returns an error.
+    #[allow(dead_code)]
+    pub fn protect(&mut self, range: &Range<PageAddr>, prot: ProtFlags) -> Result<(), AddrSpaceError> {
+        if !self.is_mapped(range) {
+            return Err(AddrSpaceError::InvalidRange {
+                msg: "range is not mapped".into(),
+            });
+        }
+        unsafe { nix::sys::mman::mprotect(NonNull::from(range.start), range.len().get(), prot) }.map_err(|errno| {
+            AddrSpaceError::RuntimeError {
+                msg: "mprotect failed".into(),
+                errno,
+            }
+        })
+    }
+
     /// Gives access to a previously mapped range of pages that doesn't have access.
     ///
     /// `data` is the new content of the pages.
@@ -950,6 +970,72 @@ mod tests {
         assert!(result.is_err());
         assert!(addrspace.pages.is_empty());
         assert!(addrspace.access.is_empty());
+
+        drop(addrspace);
+        engine_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_addr_space_protect() {
+        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let engine_thread = thread::spawn(move || {
+            engine.run(|_pagefault| Ok(())).unwrap();
+        });
+
+        addrspace.reserve_any(PAGE_SIZE.try_into().unwrap()).unwrap();
+        let mapped = addrspace
+            .map_anonymous_any(
+                PAGE_SIZE.try_into().unwrap(),
+                ProtFlags::PROT_NONE,
+                MapFlags::MAP_PRIVATE,
+            )
+            .unwrap();
+        addrspace.give_access(&mapped, SomePageAccess::ReadWrite, None).unwrap();
+
+        let mut mem_ops = NonFaultingMemOps::new().unwrap();
+        let mut mem_ops_tmp_buf = [0u8];
+
+        // Initially, page is PROT_NONE
+        assert_eq!(
+            mem_ops.read(NonNull::from(mapped.start).as_ptr(), &mut mem_ops_tmp_buf),
+            Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
+        );
+        assert_eq!(
+            mem_ops.write(NonNull::from(mapped.start).as_ptr(), &mem_ops_tmp_buf),
+            Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
+        );
+
+        addrspace.protect(&mapped, ProtFlags::PROT_READ).unwrap();
+        assert_eq!(
+            mem_ops.read(NonNull::from(mapped.start).as_ptr(), &mut mem_ops_tmp_buf),
+            Ok(mem_ops_tmp_buf.len())
+        );
+        assert_eq!(
+            mem_ops.write(NonNull::from(mapped.start).as_ptr(), &mem_ops_tmp_buf),
+            Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
+        );
+
+        addrspace
+            .protect(&mapped, ProtFlags::PROT_READ.union(ProtFlags::PROT_WRITE))
+            .unwrap();
+        assert_eq!(
+            mem_ops.read(NonNull::from(mapped.start).as_ptr(), &mut mem_ops_tmp_buf),
+            Ok(mem_ops_tmp_buf.len())
+        );
+        assert_eq!(
+            mem_ops.write(NonNull::from(mapped.start).as_ptr(), &mem_ops_tmp_buf),
+            Ok(mem_ops_tmp_buf.len())
+        );
+
+        addrspace.protect(&mapped, ProtFlags::PROT_NONE).unwrap();
+        assert_eq!(
+            mem_ops.read(NonNull::from(mapped.start).as_ptr(), &mut mem_ops_tmp_buf),
+            Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
+        );
+        assert_eq!(
+            mem_ops.write(NonNull::from(mapped.start).as_ptr(), &mem_ops_tmp_buf),
+            Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
+        );
 
         drop(addrspace);
         engine_thread.join().unwrap();
