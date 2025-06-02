@@ -922,6 +922,40 @@ mod tests {
     }
 
     #[test]
+    fn test_addr_space_map_doesnt_unmap_external() {
+        let mapped = unsafe {
+            nix::sys::mman::mmap_anonymous(
+                None,
+                PAGE_SIZE.try_into().unwrap(),
+                ProtFlags::PROT_NONE,
+                MapFlags::MAP_PRIVATE,
+            )
+            .unwrap()
+        };
+        let mapped = unsafe { MmapGuard::from_raw(mapped, PAGE_SIZE.try_into().unwrap()) };
+        let external: PageAddr = mapped.addr().try_into().unwrap();
+        let external = external.enclosing_range(mapped.length()).unwrap();
+
+        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let engine_thread = thread::spawn(move || {
+            engine.run(|_pagefault| Ok(())).unwrap();
+        });
+
+        // AddrSpace shouldn't map over externally mapped range
+        let result = addrspace.map_anonymous(
+            &external,
+            ProtFlags::PROT_NONE,
+            MapFlags::MAP_PRIVATE.union(MapFlags::MAP_FIXED),
+        );
+        assert!(result.is_err());
+        assert!(addrspace.pages.is_empty());
+        assert!(addrspace.access.is_empty());
+
+        drop(addrspace);
+        engine_thread.join().unwrap();
+    }
+
+    #[test]
     fn test_addr_space_pagefaults() {
         let (addrspace, mut engine) = AddrSpace::new(true).unwrap();
         let addrspace = Arc::new(RwLock::new(addrspace));
