@@ -813,7 +813,7 @@ mod tests {
         thread,
     };
 
-    use crate::interceptmem::{addr_space::util::MmapGuard, page_addr::PAGE_SIZE};
+    use crate::interceptmem::{addr_space::util::MmapGuard, mem_ops::NonFaultingMemOps, page_addr::PAGE_SIZE};
 
     use super::*;
 
@@ -950,6 +950,69 @@ mod tests {
         assert!(result.is_err());
         assert!(addrspace.pages.is_empty());
         assert!(addrspace.access.is_empty());
+
+        drop(addrspace);
+        engine_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_addr_space_give_upgrade_downgrade_take_access() {
+        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let engine_thread = thread::spawn(move || {
+            engine.run(|_pagefault| Ok(())).unwrap();
+        });
+
+        addrspace.reserve_any(PAGE_SIZE.try_into().unwrap()).unwrap();
+        let mapped = addrspace
+            .map_anonymous_any(
+                PAGE_SIZE.try_into().unwrap(),
+                ProtFlags::PROT_READ.union(ProtFlags::PROT_WRITE),
+                MapFlags::MAP_PRIVATE,
+            )
+            .unwrap();
+
+        let mut mem_ops = NonFaultingMemOps::new().unwrap();
+        let mut mem_ops_tmp_buf = [0u8];
+
+        // Initially, page doesn't have access
+        assert_eq!(
+            mem_ops.read(NonNull::from(mapped.start).as_ptr(), &mut mem_ops_tmp_buf),
+            Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
+        );
+        assert_eq!(
+            mem_ops.write(NonNull::from(mapped.start).as_ptr(), &mem_ops_tmp_buf),
+            Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
+        );
+
+        addrspace.give_access(&mapped, SomePageAccess::ReadOnly, None).unwrap();
+        assert_eq!(
+            mem_ops.read(NonNull::from(mapped.start).as_ptr(), &mut mem_ops_tmp_buf),
+            Ok(mem_ops_tmp_buf.len())
+        );
+        assert_eq!(
+            mem_ops.write(NonNull::from(mapped.start).as_ptr(), &mem_ops_tmp_buf),
+            Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
+        );
+
+        addrspace.upgrade_access(&mapped).unwrap();
+        assert_eq!(
+            mem_ops.read(NonNull::from(mapped.start).as_ptr(), &mut mem_ops_tmp_buf),
+            Ok(mem_ops_tmp_buf.len())
+        );
+        assert_eq!(
+            mem_ops.write(NonNull::from(mapped.start).as_ptr(), &mem_ops_tmp_buf),
+            Ok(mem_ops_tmp_buf.len())
+        );
+
+        addrspace.take_access(&mapped).unwrap();
+        assert_eq!(
+            mem_ops.read(NonNull::from(mapped.start).as_ptr(), &mut mem_ops_tmp_buf),
+            Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
+        );
+        assert_eq!(
+            mem_ops.write(NonNull::from(mapped.start).as_ptr(), &mem_ops_tmp_buf),
+            Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
+        );
 
         drop(addrspace);
         engine_thread.join().unwrap();
