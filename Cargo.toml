@@ -11,7 +11,7 @@ categories = ["data-structures", "network-programming"]
 
 [dependencies]
 thiserror = "2.0.12"
-nix = { version = "0.30.1", features = ["mman", "poll", "process", "ioctl"] }
+nix = { version = "0.30.1", features = ["mman", "poll", "process", "ioctl", "fs"] }
 rangemap = "1.5.1"
 userfaultfd = { version = "0.8.1", features = ["linux4_14", "linux5_7"] }
 linux-raw-sys = "0.9.4"
