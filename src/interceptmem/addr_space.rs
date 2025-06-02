@@ -1209,13 +1209,12 @@ mod tests {
         let mapped = addrspace
             .write()
             .unwrap()
-            .map_anonymous_any(
-                reserved.len(),
+            .map_anonymous(
+                &reserved,
                 ProtFlags::PROT_READ.union(ProtFlags::PROT_WRITE),
                 MapFlags::MAP_PRIVATE,
             )
             .unwrap();
-        assert_eq!(reserved, mapped);
 
         let page_0_ptr = NonNull::from(mapped.start).as_ptr() as *mut u8;
         let page_1_ptr = unsafe { page_0_ptr.add(PAGE_SIZE) };
