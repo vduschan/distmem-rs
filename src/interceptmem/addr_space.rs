@@ -187,14 +187,27 @@ impl AddrSpace {
         Ok(())
     }
 
-    /// Releases a previously reserved range of pages from address space.
+    /// Releases a previously reserved (but not mapped) range of pages from address space.
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn release(&mut self, _range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
-        todo!()
+    pub fn release(&mut self, range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
+        if !self.is_free(range) {
+            return Err(AddrSpaceError::InvalidRange {
+                msg: "range is not free".into(),
+            });
+        }
+        unsafe { nix::sys::mman::munmap(range.start.into(), range.len().get()) }.map_err(|errno| {
+            AddrSpaceError::RuntimeError {
+                msg: "munmap failed during release".into(),
+                errno,
+            }
+        })?;
+
+        self.pages.remove(range.clone());
+        Ok(())
     }
 
     fn find_free(&self, length: NonZeroUsize) -> Option<Range<PageAddr>> {
@@ -805,18 +818,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_addr_space_reserve_any() {
-        let (mut addrspace, _fault_receiver) = AddrSpace::new(true).unwrap();
+    fn test_addr_space_reserve_release() {
+        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let engine_thread = thread::spawn(move || {
+            engine.run(|_pagefault| Ok(())).unwrap();
+        });
+
         let reserved = addrspace.reserve_any(1.try_into().unwrap()).unwrap();
         assert_eq!(reserved.len().get(), PAGE_SIZE);
+        assert!(addrspace.access.is_empty());
+        {
+            let pages = Vec::from_iter(addrspace.pages.iter().map(|(pages, state)| (pages.clone(), *state)));
+            let pages_expected = [(reserved.clone(), PageState::Free)];
+            assert_eq!(pages, pages_expected);
+        }
 
-        let inner_reserved = addrspace.pages.get_key_value(&reserved.start).unwrap();
-        assert_eq!(*inner_reserved.0, reserved);
-        assert_eq!(*inner_reserved.1, PageState::Free);
+        addrspace.release(&reserved).unwrap();
+        assert!(addrspace.pages.is_empty());
+        assert!(addrspace.access.is_empty());
+
+        drop(addrspace);
+        engine_thread.join().unwrap();
     }
 
     #[test]
-    fn test_addr_space_reserve() {
+    fn test_addr_space_reserve_doesnt_unmap_external() {
         let mapped = unsafe {
             nix::sys::mman::mmap_anonymous(
                 None,
@@ -827,14 +853,22 @@ mod tests {
             .unwrap()
         };
         let mapped = unsafe { MmapGuard::from_raw(mapped, PAGE_SIZE.try_into().unwrap()) };
-        let occupied: PageAddr = mapped.addr().try_into().unwrap();
-        let occupied = occupied.enclosing_range(mapped.length()).unwrap();
+        let external: PageAddr = mapped.addr().try_into().unwrap();
+        let external = external.enclosing_range(mapped.length()).unwrap();
 
-        let (mut addrspace, _fault_receiver) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let engine_thread = thread::spawn(move || {
+            engine.run(|_pagefault| Ok(())).unwrap();
+        });
 
         // AddrSpace shouldn't reserve externally mapped range
-        let result = addrspace.reserve(&occupied);
+        let result = addrspace.reserve(&external);
         assert!(result.is_err());
+        assert!(addrspace.pages.is_empty());
+        assert!(addrspace.access.is_empty());
+
+        drop(addrspace);
+        engine_thread.join().unwrap();
     }
 
     #[test]
