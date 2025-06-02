@@ -320,6 +320,11 @@ impl AddrSpace {
         prot: ProtFlags,
         flags: MapFlags,
     ) -> Result<Range<PageAddr>, AddrSpaceError> {
+        if !flags.contains(MapFlags::MAP_PRIVATE) {
+            return Err(AddrSpaceError::InvalidFlags {
+                msg: "only private memory is supported".into(),
+            });
+        }
         if flags.contains(MapFlags::MAP_FIXED) && flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
             return Err(AddrSpaceError::InvalidFlags {
                 msg: "MAP_FIXED and MAP_FIXED_NOREPLACE flags are mutually exclusive".into(),
