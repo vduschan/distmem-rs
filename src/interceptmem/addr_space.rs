@@ -1,7 +1,6 @@
 use std::{
     ffi::c_void,
     num::NonZeroUsize,
-    ops::Range,
     os::fd::{AsFd, OwnedFd},
     ptr::NonNull,
     sync::Arc,
@@ -18,10 +17,10 @@ use rangemap::RangeMap;
 use thiserror::Error;
 use util::MmapGuard;
 
-use crate::interceptmem::userfaultfd_ext::UffdExt;
+use crate::{interceptmem::userfaultfd_ext::UffdExt, nonempty_range::NonEmptyRange};
 
 use super::{
-    page_addr::{PAGE_SIZE, PageAddr, RangeExtLen},
+    page_addr::{NonEmptyRangeExtLen, PAGE_SIZE, PageAddr, RangeExtLen},
     range_ext::RangeExtOps,
     userfaultfd_ext::{UserfaultFdFlags, userfaultfd_create},
 };
@@ -124,10 +123,10 @@ impl AddrSpace {
     ///
     /// # Returns
     ///
-    /// Returns a `Range<PageAddr>` representing the reserved range if successful,
+    /// Returns a `NonEmptyRange<PageAddr>` representing the reserved range if successful,
     /// otherwise returns an error.
     #[allow(dead_code)]
-    pub fn reserve_any(&mut self, length: NonZeroUsize) -> Result<Range<PageAddr>, AddrSpaceError> {
+    pub fn reserve_any(&mut self, length: NonZeroUsize) -> Result<NonEmptyRange<PageAddr>, AddrSpaceError> {
         let mmapped =
             unsafe { nix::sys::mman::mmap_anonymous(None, length, ProtFlags::PROT_NONE, MapFlags::MAP_PRIVATE) }
                 .map_err(|errno| AddrSpaceError::RuntimeError {
@@ -142,7 +141,7 @@ impl AddrSpace {
             .expect("mmap_anonymous should've returned pages that can be represented by the PageAddr");
 
         assert!(!self.pages.overlaps(&reserved));
-        self.pages.insert(reserved.clone(), PageState::Free);
+        self.pages.insert(reserved.clone().into(), PageState::Free);
         mmapped.consume(); // `self` now owns this range
         Ok(reserved)
     }
@@ -153,7 +152,7 @@ impl AddrSpace {
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn reserve(&mut self, range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
+    pub fn reserve(&mut self, range: &NonEmptyRange<PageAddr>) -> Result<(), AddrSpaceError> {
         if self.pages.overlaps(range) {
             return Err(AddrSpaceError::InvalidRange {
                 msg: format!("part of the {:?} range already reserved", range),
@@ -182,7 +181,7 @@ impl AddrSpace {
             .enclosing_range(mmapped.length())
             .expect("mmap_anonymous should've returned pages that can be represented by the PageAddr");
 
-        self.pages.insert(reserved, PageState::Free);
+        self.pages.insert(reserved.into(), PageState::Free);
         mmapped.consume(); // `self` now owns this range
         Ok(())
     }
@@ -193,7 +192,7 @@ impl AddrSpace {
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn release(&mut self, range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
+    pub fn release(&mut self, range: &NonEmptyRange<PageAddr>) -> Result<(), AddrSpaceError> {
         if !self.is_free(range) {
             return Err(AddrSpaceError::InvalidRange {
                 msg: "range is not free".into(),
@@ -206,13 +205,13 @@ impl AddrSpace {
             }
         })?;
 
-        self.pages.remove(range.clone());
+        self.pages.remove(range.clone().into());
         Ok(())
     }
 
-    fn find_free(&self, length: NonZeroUsize) -> Option<Range<PageAddr>> {
+    fn find_free(&self, length: NonZeroUsize) -> Option<NonEmptyRange<PageAddr>> {
         self.pages.iter().find_map(|(pages, state)| {
-            if pages.len() >= length && *state == PageState::Free {
+            if pages.len() >= length.get() && *state == PageState::Free {
                 Some(
                     pages
                         .start
@@ -225,37 +224,37 @@ impl AddrSpace {
         })
     }
 
-    fn is_reserved(&self, range: &Range<PageAddr>) -> bool {
+    fn is_reserved(&self, range: &NonEmptyRange<PageAddr>) -> bool {
         self.pages.gaps(range).next().is_none()
     }
 
-    fn get_state(&self, range: &Range<PageAddr>) -> Option<&PageState> {
+    fn get_state(&self, range: &NonEmptyRange<PageAddr>) -> Option<&PageState> {
         let (pages, state) = self.pages.get_key_value(&range.start)?;
         if pages.encloses(range) { Some(state) } else { None }
     }
 
-    fn is_free(&self, range: &Range<PageAddr>) -> bool {
+    fn is_free(&self, range: &NonEmptyRange<PageAddr>) -> bool {
         self.get_state(range).is_some_and(|state| *state == PageState::Free)
     }
 
-    fn is_mapped(&self, range: &Range<PageAddr>) -> bool {
+    fn is_mapped(&self, range: &NonEmptyRange<PageAddr>) -> bool {
         self.get_state(range).is_some_and(|state| *state == PageState::Mapped)
     }
 
-    fn get_access(&self, range: &Range<PageAddr>) -> Option<&PageAccess> {
+    fn get_access(&self, range: &NonEmptyRange<PageAddr>) -> Option<&PageAccess> {
         let (pages, access) = self.access.get_key_value(&range.start)?;
         if pages.encloses(range) { Some(access) } else { None }
     }
 
-    fn has_none_access(&self, range: &Range<PageAddr>) -> bool {
+    fn has_none_access(&self, range: &NonEmptyRange<PageAddr>) -> bool {
         self.get_access(range).is_some_and(|access| access.is_none())
     }
 
-    fn has_some_access(&self, range: &Range<PageAddr>) -> bool {
+    fn has_some_access(&self, range: &NonEmptyRange<PageAddr>) -> bool {
         self.is_mapped(range) && self.access.overlapping(range).all(|(_pages, access)| access.is_some())
     }
 
-    fn has_ro_access(&self, range: &Range<PageAddr>) -> bool {
+    fn has_ro_access(&self, range: &NonEmptyRange<PageAddr>) -> bool {
         self.is_mapped(range)
             && self
                 .access
@@ -263,7 +262,7 @@ impl AddrSpace {
                 .all(|(_pages, access)| *access == Some(SomePageAccess::ReadOnly))
     }
 
-    fn has_rw_access(&self, range: &Range<PageAddr>) -> bool {
+    fn has_rw_access(&self, range: &NonEmptyRange<PageAddr>) -> bool {
         self.is_mapped(range)
             && self
                 .access
@@ -280,7 +279,7 @@ impl AddrSpace {
     ///
     /// # Returns
     ///
-    /// Returns a `Range<PageAddr>` representing the mapped range if successful,
+    /// Returns a `NonEmptyRange<PageAddr>` representing the mapped range if successful,
     /// otherwise returns an error.
     #[allow(dead_code)]
     pub fn map_anonymous_any(
@@ -288,7 +287,7 @@ impl AddrSpace {
         length: NonZeroUsize,
         prot: ProtFlags,
         flags: MapFlags,
-    ) -> Result<Range<PageAddr>, AddrSpaceError> {
+    ) -> Result<NonEmptyRange<PageAddr>, AddrSpaceError> {
         if flags.contains(MapFlags::MAP_FIXED) || flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
             return Err(AddrSpaceError::InvalidFlags {
                 msg: "MAP_FIXED and MAP_FIXED_NOREPLACE flags invalid without specified range".into(),
@@ -316,10 +315,10 @@ impl AddrSpace {
     #[allow(dead_code)]
     pub fn map_anonymous(
         &mut self,
-        range: &Range<PageAddr>,
+        range: &NonEmptyRange<PageAddr>,
         prot: ProtFlags,
         flags: MapFlags,
-    ) -> Result<Range<PageAddr>, AddrSpaceError> {
+    ) -> Result<NonEmptyRange<PageAddr>, AddrSpaceError> {
         if !flags.contains(MapFlags::MAP_PRIVATE) {
             return Err(AddrSpaceError::InvalidFlags {
                 msg: "only private memory is supported".into(),
@@ -400,8 +399,8 @@ impl AddrSpace {
                 errno,
             })?;
             assert_eq!(mremaped, range.start.into());
-            self.pages.insert(range.clone(), PageState::Mapped);
-            self.access.insert(range.clone(), None);
+            self.pages.insert(range.clone().into(), PageState::Mapped);
+            self.access.insert(range.clone().into(), None);
             let _ = mmapped.consume(); // `self` now owns this range
             return Ok(range.clone());
         }
@@ -429,7 +428,7 @@ impl AddrSpace {
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn unmap(&mut self, range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
+    pub fn unmap(&mut self, range: &NonEmptyRange<PageAddr>) -> Result<(), AddrSpaceError> {
         let to_unmap = RangeMap::from_iter(
             self.pages
                 .overlapping(range)
@@ -439,7 +438,7 @@ impl AddrSpace {
             unsafe {
                 nix::sys::mman::mmap_anonymous(
                     Some(NonZeroUsize::new(NonNull::from(range.start).as_ptr() as usize).unwrap()),
-                    range.len(),
+                    range.len().try_into().expect("range should be non-empty"),
                     ProtFlags::PROT_NONE,
                     MapFlags::MAP_PRIVATE.union(MapFlags::MAP_FIXED),
                 )
@@ -457,7 +456,7 @@ impl AddrSpace {
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn protect(&mut self, range: &Range<PageAddr>, prot: ProtFlags) -> Result<(), AddrSpaceError> {
+    pub fn protect(&mut self, range: &NonEmptyRange<PageAddr>, prot: ProtFlags) -> Result<(), AddrSpaceError> {
         if !self.is_mapped(range) {
             return Err(AddrSpaceError::InvalidRange {
                 msg: "range is not mapped".into(),
@@ -486,7 +485,7 @@ impl AddrSpace {
     #[allow(dead_code)]
     pub fn give_access(
         &mut self,
-        range: &Range<PageAddr>,
+        range: &NonEmptyRange<PageAddr>,
         access: SomePageAccess,
         data: Option<&[u8]>,
     ) -> Result<(), AddrSpaceError> {
@@ -552,7 +551,7 @@ impl AddrSpace {
                 }
             }
         }
-        self.access.insert(range.clone(), Some(access));
+        self.access.insert(range.clone().into(), Some(access));
         Ok(())
     }
 
@@ -563,7 +562,7 @@ impl AddrSpace {
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn upgrade_access(&mut self, range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
+    pub fn upgrade_access(&mut self, range: &NonEmptyRange<PageAddr>) -> Result<(), AddrSpaceError> {
         if !self.has_ro_access(range) {
             return Err(AddrSpaceError::InvalidRange {
                 msg: "part of the range doesn't have RO access".into(),
@@ -575,7 +574,8 @@ impl AddrSpace {
                 msg: format!("userfaultfd remove_write_protection failed with: {}", err),
                 errno: Errno::UnknownErrno,
             })?;
-        self.access.insert(range.clone(), Some(SomePageAccess::ReadWrite));
+        self.access
+            .insert(range.clone().into(), Some(SomePageAccess::ReadWrite));
         Ok(())
     }
 
@@ -586,7 +586,7 @@ impl AddrSpace {
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn downgrade_access(&mut self, range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
+    pub fn downgrade_access(&mut self, range: &NonEmptyRange<PageAddr>) -> Result<(), AddrSpaceError> {
         if !self.has_rw_access(range) {
             return Err(AddrSpaceError::InvalidRange {
                 msg: "part of the range doesn't have RW access".into(),
@@ -598,7 +598,7 @@ impl AddrSpace {
                 msg: format!("userfaultfd write_protect failed with: {}", err),
                 errno: Errno::UnknownErrno,
             })?;
-        self.access.insert(range.clone(), Some(SomePageAccess::ReadOnly));
+        self.access.insert(range.clone().into(), Some(SomePageAccess::ReadOnly));
         Ok(())
     }
 
@@ -613,7 +613,7 @@ impl AddrSpace {
     ///
     /// Returns `Ok(())` if successful, otherwise returns an error.
     #[allow(dead_code)]
-    pub fn take_access(&mut self, range: &Range<PageAddr>) -> Result<(), AddrSpaceError> {
+    pub fn take_access(&mut self, range: &NonEmptyRange<PageAddr>) -> Result<(), AddrSpaceError> {
         if !self.has_some_access(range) {
             return Err(AddrSpaceError::InvalidRange {
                 msg: "part of the range doesn't have access".into(),
@@ -626,7 +626,7 @@ impl AddrSpace {
                 errno,
             },
         )?;
-        self.access.insert(range.clone(), None);
+        self.access.insert(range.clone().into(), None);
         Ok(())
     }
 
@@ -821,7 +821,7 @@ impl Drop for AddrSpace {
     fn drop(&mut self) {
         for (range, _state) in self.pages.iter() {
             unsafe {
-                nix::sys::mman::munmap(range.start.into(), range.len().get())
+                nix::sys::mman::munmap(range.start.into(), range.len())
                     .expect("munmap should've succeeded on reserved range");
             };
         }
@@ -854,7 +854,7 @@ mod tests {
         assert!(addrspace.access.is_empty());
         {
             let pages = Vec::from_iter(addrspace.pages.iter().map(|(pages, state)| (pages.clone(), *state)));
-            let pages_expected = [(reserved.clone(), PageState::Free)];
+            let pages_expected = [(reserved.clone().into(), PageState::Free)];
             assert_eq!(pages, pages_expected);
         }
 
@@ -925,18 +925,18 @@ mod tests {
 
         {
             let pages = Vec::from_iter(addrspace.pages.iter().map(|(pages, state)| (pages.clone(), *state)));
-            let pages_expected = [(mapped.clone(), PageState::Mapped)];
+            let pages_expected = [(mapped.clone().into(), PageState::Mapped)];
             assert_eq!(pages, pages_expected);
 
             let access = Vec::from_iter(addrspace.access.iter().map(|(pages, access)| (pages.clone(), *access)));
-            let access_expected = [(mapped.clone(), None::<SomePageAccess>)];
+            let access_expected = [(mapped.clone().into(), None::<SomePageAccess>)];
             assert_eq!(access, access_expected);
         }
 
         addrspace.unmap(&mapped).unwrap();
         {
             let pages = Vec::from_iter(addrspace.pages.iter().map(|(pages, state)| (pages.clone(), *state)));
-            let pages_expected = [(mapped.clone(), PageState::Free)];
+            let pages_expected = [(mapped.clone().into(), PageState::Free)];
             assert_eq!(pages, pages_expected);
 
             assert!(addrspace.access.is_empty());

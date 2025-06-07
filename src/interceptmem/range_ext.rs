@@ -50,7 +50,7 @@ mod tests {
             .unwrap();
 
         let intersection = range.intersection(&intersecting_range);
-        assert_eq!(intersection.len().get(), 5 * PAGE_SIZE);
+        assert_eq!(intersection.len(), 5 * PAGE_SIZE);
         assert_eq!(
             intersection.start,
             PageAddr::try_from(NonNull::new((PAGE_SIZE * 20) as *mut c_void).unwrap()).unwrap()

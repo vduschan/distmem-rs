@@ -1,6 +1,13 @@
-use std::{ffi::c_void, num::NonZeroUsize, ops::Range, ptr::NonNull};
+use std::{
+    ffi::c_void,
+    num::NonZeroUsize,
+    ops::{Deref, Range},
+    ptr::NonNull,
+};
 
 use thiserror::Error;
+
+use crate::nonempty_range::NonEmptyRange;
 
 #[allow(dead_code)]
 pub const PAGE_BITS: usize = 12;
@@ -56,27 +63,40 @@ impl PageAddr {
         let addr = (value.as_ptr() as usize) & PAGE_MASK;
         Some(PageAddr(NonZeroUsize::new(addr)?))
     }
-    pub fn enclosing_range(self, length: NonZeroUsize) -> Option<Range<PageAddr>> {
+    pub fn enclosing_range(self, length: NonZeroUsize) -> Option<NonEmptyRange<PageAddr>> {
         let end_addr = self.0.checked_add(length.get())?;
         let end_page_addr = end_addr.saturating_add(PAGE_SIZE - 1).get() & PAGE_MASK;
-        Some(self..PageAddr(NonZeroUsize::new(end_page_addr).expect("end page should be > 0")))
+        let range = self..PageAddr(NonZeroUsize::new(end_page_addr).expect("end page should be > 0"));
+        Some(NonEmptyRange::try_from(range).expect("end page should be > than start page"))
     }
 }
 
 #[allow(dead_code)]
 pub trait RangeExtLen {
-    fn len(&self) -> NonZeroUsize;
+    fn len(&self) -> usize;
 }
 
 impl RangeExtLen for Range<PageAddr> {
-    fn len(&self) -> NonZeroUsize {
-        let length = self
-            .end
+    fn len(&self) -> usize {
+        if self.is_empty() {
+            return 0;
+        }
+        self.end
             .0
             .get()
             .checked_sub(self.start.0.get())
-            .expect("invariant: start page should be < than end page");
-        NonZeroUsize::new(length).expect("invariant: start page should be < than end page")
+            .expect("invariant: start page should be < than end page")
+    }
+}
+
+#[allow(dead_code)]
+pub trait NonEmptyRangeExtLen {
+    fn len(&self) -> NonZeroUsize;
+}
+
+impl NonEmptyRangeExtLen for NonEmptyRange<PageAddr> {
+    fn len(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.deref().len()).expect("non-empty range should have non-zero length")
     }
 }
 
@@ -124,7 +144,7 @@ mod tests {
     fn test_range_ext_len() {
         let start = PageAddr(NonZeroUsize::new(42 * PAGE_SIZE).unwrap());
         let end = PageAddr(NonZeroUsize::new(44 * PAGE_SIZE).unwrap());
-        let range = start..end;
+        let range = NonEmptyRange::try_from(start..end).unwrap();
         assert_eq!(range.len(), NonZeroUsize::new(2 * PAGE_SIZE).unwrap());
     }
 }
