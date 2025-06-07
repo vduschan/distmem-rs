@@ -35,6 +35,21 @@ pub struct PageFault {
     thread_id: Pid,
 }
 
+impl PageFault {
+    #[allow(dead_code)]
+    pub fn addr(&self) -> *mut c_void {
+        self.addr
+    }
+    #[allow(dead_code)]
+    pub fn access(&self) -> SomePageAccess {
+        self.access
+    }
+    #[allow(dead_code)]
+    pub fn thread_id(&self) -> Pid {
+        self.thread_id
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageState {
     Free,
@@ -1144,13 +1159,13 @@ mod tests {
                         return Ok(());
                     };
 
-                    let addr = PageAddr::containing_page(NonNull::new(pagefault.addr).unwrap()).unwrap();
+                    let addr = PageAddr::containing_page(NonNull::new(pagefault.addr()).unwrap()).unwrap();
                     let range = addr.enclosing_range(NonZeroUsize::new(1).unwrap()).unwrap();
 
                     match fault_counter {
                         0 => {
                             assert_eq!(addr, page_0_addr);
-                            assert_eq!(pagefault.access, SomePageAccess::ReadOnly);
+                            assert_eq!(pagefault.access(), SomePageAccess::ReadOnly);
                             let data: [u8; PAGE_SIZE] = [42; PAGE_SIZE];
                             addrspace
                                 .write()
@@ -1160,12 +1175,12 @@ mod tests {
                         }
                         1 => {
                             assert_eq!(addr, page_0_addr);
-                            assert_eq!(pagefault.access, SomePageAccess::ReadWrite);
+                            assert_eq!(pagefault.access(), SomePageAccess::ReadWrite);
                             addrspace.write().unwrap().upgrade_access(&range).unwrap();
                         }
                         2 => {
                             assert_eq!(addr, page_1_addr);
-                            assert_eq!(pagefault.access, SomePageAccess::ReadOnly);
+                            assert_eq!(pagefault.access(), SomePageAccess::ReadOnly);
                             addrspace
                                 .write()
                                 .unwrap()
@@ -1180,7 +1195,7 @@ mod tests {
                         }
                         3 => {
                             assert_eq!(addr, page_0_addr);
-                            assert_eq!(pagefault.access, SomePageAccess::ReadOnly);
+                            assert_eq!(pagefault.access(), SomePageAccess::ReadOnly);
                             addrspace
                                 .write()
                                 .unwrap()
@@ -1195,7 +1210,7 @@ mod tests {
                         }
                         4 => {
                             assert_eq!(addr, page_1_addr);
-                            assert_eq!(pagefault.access, SomePageAccess::ReadWrite);
+                            assert_eq!(pagefault.access(), SomePageAccess::ReadWrite);
                             addrspace.write().unwrap().upgrade_access(&range).unwrap();
                         }
 
