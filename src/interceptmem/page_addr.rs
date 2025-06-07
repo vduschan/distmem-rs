@@ -38,7 +38,7 @@ impl TryFrom<NonNull<c_void>> for PageAddr {
         let addr = NonZeroUsize::new(value.as_ptr() as usize).expect("non-null ptr is non-0");
         if addr.get() & !PAGE_MASK != 0 {
             return Err(PageAddrError::InvalidPointer {
-                msg: "pointer points to the null page".into(),
+                msg: "pointer is not page aligned".into(),
             });
         }
         Ok(PageAddr(addr))
