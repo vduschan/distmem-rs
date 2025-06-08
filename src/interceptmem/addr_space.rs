@@ -714,7 +714,7 @@ pub enum AddrSpaceEngineError {
 
 impl AddrSpaceEngine {
     #[allow(dead_code)]
-    pub fn run<F>(&mut self, fault_handler: F) -> Result<(), AddrSpaceEngineError>
+    pub fn run<F>(self, fault_handler: F) -> Result<(), AddrSpaceEngineError>
     where
         F: Fn(PageFault) -> Result<(), Errno>,
     {
@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_reserve_release() {
-        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
         let engine_thread = thread::spawn(move || {
             engine.run(|_pagefault| Ok(())).unwrap();
         });
@@ -896,7 +896,7 @@ mod tests {
         let external: PageAddr = mapped.addr().try_into().unwrap();
         let external = external.enclosing_range(mapped.length()).unwrap();
 
-        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
         let engine_thread = thread::spawn(move || {
             engine.run(|_pagefault| Ok(())).unwrap();
         });
@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_map_unmap() {
-        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
         let engine_thread = thread::spawn(move || {
             engine.run(|_pagefault| Ok(())).unwrap();
         });
@@ -976,7 +976,7 @@ mod tests {
         let external: PageAddr = mapped.addr().try_into().unwrap();
         let external = external.enclosing_range(mapped.length()).unwrap();
 
-        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
         let engine_thread = thread::spawn(move || {
             engine.run(|_pagefault| Ok(())).unwrap();
         });
@@ -997,7 +997,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_protect() {
-        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
         let engine_thread = thread::spawn(move || {
             engine.run(|_pagefault| Ok(())).unwrap();
         });
@@ -1063,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_give_upgrade_downgrade_take_access() {
-        let (mut addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
         let engine_thread = thread::spawn(move || {
             engine.run(|_pagefault| Ok(())).unwrap();
         });
@@ -1126,7 +1126,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_pagefaults() {
-        let (addrspace, mut engine) = AddrSpace::new(true).unwrap();
+        let (addrspace, engine) = AddrSpace::new(true).unwrap();
         let addrspace = Arc::new(RwLock::new(addrspace));
 
         let reserved = addrspace
