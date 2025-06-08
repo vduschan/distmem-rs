@@ -9,7 +9,7 @@ use std::{
 use nix::{
     errno::Errno,
     poll::{PollFd, PollFlags, PollTimeout, poll},
-    sys::mman::{MRemapFlags, MapFlags, MmapAdvise, ProtFlags},
+    sys::mman::{MapFlags, MmapAdvise, ProtFlags},
     unistd::Pid,
     unistd::pipe,
 };
@@ -52,6 +52,7 @@ impl PageFault {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageState {
+    // Free pages are userfaultfd registered, unpopulated and `PROT_NONE`.
     Free,
     Mapped,
 }
@@ -94,9 +95,7 @@ pub enum AddrSpaceError {
 impl AddrSpace {
     #[allow(dead_code)]
     pub fn new(user_mode_only: bool) -> Result<(AddrSpace, AddrSpaceEngine), AddrSpaceError> {
-        let required_features = uffd::FeatureFlags::PAGEFAULT_FLAG_WP
-            .union(uffd::FeatureFlags::THREAD_ID)
-            .union(uffd::FeatureFlags::EVENT_REMAP);
+        let required_features = uffd::FeatureFlags::PAGEFAULT_FLAG_WP.union(uffd::FeatureFlags::THREAD_ID);
         let required_ioctls = uffd::IoctlFlags::REGISTER
             .union(uffd::IoctlFlags::UNREGISTER)
             .union(uffd::IoctlFlags::API);
@@ -155,6 +154,25 @@ impl AddrSpace {
             .enclosing_range(mmapped.length())
             .expect("mmap_anonymous should've returned pages that can be represented by the PageAddr");
 
+        let supported_ioctls = self
+            .uffd
+            .register_with_mode(
+                NonNull::from(reserved.start).as_ptr(),
+                reserved.len().get(),
+                uffd::RegisterMode::MISSING.union(uffd::RegisterMode::WRITE_PROTECT),
+            )
+            .map_err(|err| AddrSpaceError::RuntimeError {
+                msg: format!("failed registering pages with the userfaultfd: {}", err),
+                errno: Errno::UnknownErrno,
+            })?;
+        assert!(supported_ioctls.contains(self.required_ioctls));
+        // Ensure that `reserved` doesn't have populated pages
+        unsafe { nix::sys::mman::madvise(reserved.start.into(), reserved.len().get(), MmapAdvise::MADV_DONTNEED) }
+            .map_err(|errno| AddrSpaceError::RuntimeError {
+                msg: "madvise failed dropping the pages".into(),
+                errno,
+            })?;
+
         assert!(!self.pages.overlaps(&reserved));
         self.pages.insert(reserved.clone().into(), PageState::Free);
         mmapped.consume(); // `self` now owns this range
@@ -195,6 +213,25 @@ impl AddrSpace {
         let reserved = reserved
             .enclosing_range(mmapped.length())
             .expect("mmap_anonymous should've returned pages that can be represented by the PageAddr");
+
+        let supported_ioctls = self
+            .uffd
+            .register_with_mode(
+                NonNull::from(reserved.start).as_ptr(),
+                reserved.len().get(),
+                uffd::RegisterMode::MISSING.union(uffd::RegisterMode::WRITE_PROTECT),
+            )
+            .map_err(|err| AddrSpaceError::RuntimeError {
+                msg: format!("failed registering pages with the userfaultfd: {}", err),
+                errno: Errno::UnknownErrno,
+            })?;
+        assert!(supported_ioctls.contains(self.required_ioctls));
+        // Ensure that `reserved` doesn't have populated pages
+        unsafe { nix::sys::mman::madvise(reserved.start.into(), reserved.len().get(), MmapAdvise::MADV_DONTNEED) }
+            .map_err(|errno| AddrSpaceError::RuntimeError {
+                msg: "madvise failed dropping the pages".into(),
+                errno,
+            })?;
 
         self.pages.insert(reserved.into(), PageState::Free);
         mmapped.consume(); // `self` now owns this range
@@ -345,78 +382,22 @@ impl AddrSpace {
             });
         }
 
-        // Desired pages are `mmap`ped and setup out of place, and then
-        // `mremap`ped into place.
-        //
-        // This is in order to make mapping atomic:
-        // - if any of the calls fails during the setup, bail out without any
-        //   changes to the address space
-        // - moving pages into place is done using `mremap`, which is atomic
-
-        // `mmap` with `PROT_NONE`, so that no one has access to the `mmapped`
-        // pages while they're setup.
-        // Real `prot` flags are applied after the `mmapped` pages have been
-        // registered to the userfaultfd.
-        let mmapped = unsafe {
-            nix::sys::mman::mmap_anonymous(
-                None,
-                range.len(),
-                ProtFlags::PROT_NONE,
-                flags
-                    .difference(MapFlags::MAP_FIXED)
-                    .difference(MapFlags::MAP_FIXED_NOREPLACE),
-            )
-        }
-        .map_err(|errno| AddrSpaceError::RuntimeError {
-            msg: format!("mmap_anonymous(len: {}) failed", range.len()),
-            errno,
-        })?;
-        let mmapped = unsafe { util::MmapGuard::from_raw(mmapped, range.len()) };
-        let supported_ioctls = self
-            .uffd
-            .register_with_mode(
-                mmapped.addr().as_ptr(),
-                mmapped.length().get(),
-                uffd::RegisterMode::MISSING.union(uffd::RegisterMode::WRITE_PROTECT),
-            )
-            .map_err(|err| AddrSpaceError::RuntimeError {
-                msg: format!("failed registering pages with the userfaultfd: {}", err),
-                errno: Errno::UnknownErrno,
-            })?;
-        assert!(supported_ioctls.contains(self.required_ioctls));
-        // Ensure that `mmapped` is protected by userfaultfd
-        unsafe { nix::sys::mman::madvise(mmapped.addr(), mmapped.length().get(), MmapAdvise::MADV_DONTNEED) }.map_err(
-            |errno| AddrSpaceError::RuntimeError {
-                msg: "madvise failed dropping the pages".into(),
-                errno,
-            },
-        )?;
-        unsafe { nix::sys::mman::mprotect(mmapped.addr(), mmapped.length().get(), prot) }.map_err(|errno| {
-            AddrSpaceError::RuntimeError {
-                msg: "mprotect failed applying the desired prot".into(),
-                errno,
-            }
-        })?;
-
-        // Try to move `mmapped` pages to the specified `range`.
+        // Try to use the `range`
         if self.is_free(range) || (flags.contains(MapFlags::MAP_FIXED) && self.is_reserved(range)) {
-            let mremaped = unsafe {
-                nix::sys::mman::mremap(
-                    mmapped.addr(),
-                    mmapped.length().get(),
-                    mmapped.length().get(),
-                    MRemapFlags::MREMAP_FIXED.union(MRemapFlags::MREMAP_MAYMOVE),
-                    Some(range.start.into()),
-                )
-            }
-            .map_err(|errno| AddrSpaceError::RuntimeError {
-                msg: format!("mremap failed to move pages into the {:?} range", range),
-                errno,
-            })?;
-            assert_eq!(mremaped, range.start.into());
+            // Drop the `range` - now it's protected by userfaultfd
+            unsafe { nix::sys::mman::madvise(range.start.into(), range.len().get(), MmapAdvise::MADV_DONTNEED) }
+                .map_err(|errno| AddrSpaceError::RuntimeError {
+                    msg: "madvise failed dropping the pages".into(),
+                    errno,
+                })?;
+            // If `mprotect` fails it's an unrecoverable error as `range` data is lost.
+            // This could be avoided by a more complex logic, but at this point it's not
+            // worth handling it as it's extremely unlikely that `mprotect` would fail.
+            unsafe { nix::sys::mman::mprotect(range.start.into(), range.len().get(), prot) }
+                .expect("shouldn't have failed, otherwise unrecoverable error");
+
             self.pages.insert(range.clone().into(), PageState::Mapped);
             self.access.insert(range.clone().into(), None);
-            let _ = mmapped.consume(); // `self` now owns this range
             return Ok(range.clone());
         }
 
@@ -433,7 +414,7 @@ impl AddrSpace {
             });
         }
 
-        // Retry `map_anonymous_any` for non-fixed mappings
+        // Retry with `map_anonymous_any` for non-fixed mappings
         self.map_anonymous_any(range.len(), prot, flags)
     }
 
@@ -450,17 +431,15 @@ impl AddrSpace {
                 .map(|(pages, _state)| (pages.intersection(range), ())),
         );
         for (range, _) in to_unmap {
-            unsafe {
-                nix::sys::mman::mmap_anonymous(
-                    Some(NonZeroUsize::new(NonNull::from(range.start).as_ptr() as usize).unwrap()),
-                    range.len().try_into().expect("range should be non-empty"),
-                    ProtFlags::PROT_NONE,
-                    MapFlags::MAP_PRIVATE.union(MapFlags::MAP_FIXED),
-                )
-            }
-            .expect("shouldn't have failed, otherwise unrecoverable error");
-            self.pages.insert(range.clone(), PageState::Free);
-            self.access.remove(range);
+            let range = NonEmptyRange::try_from(range).expect("range should be nonempty");
+
+            unsafe { nix::sys::mman::madvise(range.start.into(), range.len().get(), MmapAdvise::MADV_DONTNEED) }
+                .expect("shouldn't have failed, otherwise unrecoverable error");
+            unsafe { nix::sys::mman::mprotect(range.start.into(), range.len().get(), ProtFlags::PROT_NONE) }
+                .expect("shouldn't have failed, otherwise unrecoverable error");
+
+            self.pages.insert(range.clone().into(), PageState::Free);
+            self.access.remove(range.into());
         }
         Ok(())
     }
@@ -771,31 +750,26 @@ impl AddrSpaceEngine {
                     msg: format!("userfaultfd event error: {}", err),
                     errno: Errno::UnknownErrno,
                 })?;
-                match event {
-                    uffd::Event::Pagefault {
-                        kind: _,
-                        rw,
+                if let uffd::Event::Pagefault {
+                    kind: _,
+                    rw,
+                    addr,
+                    thread_id,
+                } = event
+                {
+                    let access = if rw == uffd::ReadWrite::Write {
+                        SomePageAccess::ReadWrite
+                    } else {
+                        SomePageAccess::ReadOnly
+                    };
+                    fault_handler(PageFault {
                         addr,
-                        thread_id,
-                    } => {
-                        let access = if rw == uffd::ReadWrite::Write {
-                            SomePageAccess::ReadWrite
-                        } else {
-                            SomePageAccess::ReadOnly
-                        };
-                        fault_handler(PageFault {
-                            addr,
-                            access,
-                            thread_id: Pid::from_raw(thread_id.as_raw()),
-                        })
-                        .map_err(|errno| AddrSpaceEngineError::FaultHandlerError { errno })?;
-                        continue;
-                    }
-                    uffd::Event::Remap { .. } => {
-                        // Just receive `Remap` event to unblock the `mremap` caller
-                        continue;
-                    }
-                    _ => panic!("shouldn't have received any other event"),
+                        access,
+                        thread_id: Pid::from_raw(thread_id.as_raw()),
+                    })
+                    .map_err(|errno| AddrSpaceEngineError::FaultHandlerError { errno })?;
+                } else {
+                    panic!("shouldn't have received any other event");
                 }
             }
         }
