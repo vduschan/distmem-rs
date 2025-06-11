@@ -1,7 +1,7 @@
 use std::{
     ffi::c_void,
     num::NonZeroUsize,
-    os::fd::{AsFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
     ptr::NonNull,
     sync::Arc,
 };
@@ -10,11 +10,11 @@ use nix::{
     errno::Errno,
     poll::{PollFd, PollFlags, PollTimeout, poll},
     sys::mman::{MapFlags, MmapAdvise, ProtFlags},
-    unistd::Pid,
-    unistd::pipe,
+    unistd::{Pid, pipe},
 };
 use rangemap::RangeMap;
 use thiserror::Error;
+use tokio::io::unix::AsyncFd;
 use util::MmapGuard;
 
 use crate::{interceptmem::userfaultfd_ext::UffdExt, nonempty_range::NonEmptyRange};
@@ -782,12 +782,54 @@ impl PageFaultReceiver {
     }
 
     #[allow(dead_code)]
-    fn recv<'a>(
+    pub fn recv<'a>(
         &mut self,
         buf: &'a mut PageFaultBuffer,
     ) -> Result<impl Iterator<Item = PageFault> + 'a, PageFaultReceiverError> {
         self.wait_readable()?;
         self.recv_nonblocking(buf)
+    }
+}
+
+pub struct PageFaultReceiverAsync {
+    inner: PageFaultReceiver,
+    alive_borrowed: AsyncFd<RawFd>,
+    uffd_borrowed: AsyncFd<RawFd>,
+}
+
+impl From<PageFaultReceiver> for PageFaultReceiverAsync {
+    fn from(value: PageFaultReceiver) -> Self {
+        let alive_borrowed = AsyncFd::new(value.alive.as_raw_fd()).unwrap();
+        let uffd_borrowed = AsyncFd::new(value.uffd.as_raw_fd()).unwrap();
+        Self {
+            inner: value,
+            alive_borrowed,
+            uffd_borrowed,
+        }
+    }
+}
+
+impl PageFaultReceiverAsync {
+    #[allow(dead_code)]
+    pub async fn recv<'a>(
+        &mut self,
+        buf: &'a mut PageFaultBuffer,
+    ) -> Result<impl Iterator<Item = PageFault> + 'a, PageFaultReceiverError> {
+        let mut readable_guard = tokio::select! {
+            alive_readable = self.alive_borrowed.readable() => {
+                let _ = alive_readable.unwrap();
+                return Err(PageFaultReceiverError::AddrSpaceDropped);
+            },
+            uffd_readable = self.uffd_borrowed.readable() => {
+                uffd_readable.unwrap()
+            }
+        };
+        let pagefaults = self.inner.recv_nonblocking(buf)?;
+        let mut pagefaults = pagefaults.peekable();
+        if pagefaults.peek().is_none() {
+            readable_guard.clear_ready();
+        }
+        Ok(pagefaults)
     }
 }
 
@@ -836,7 +878,7 @@ impl Drop for AddrSpace {
 mod tests {
     use std::{
         sync::{
-            RwLock,
+            RwLock, Weak,
             atomic::{AtomicUsize, Ordering},
         },
         thread,
@@ -1076,120 +1118,88 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_addr_space_pagefaults() {
-        let (addrspace, mut pagefault_receiver) = AddrSpace::new(true).unwrap();
-        let addrspace = Arc::new(RwLock::new(addrspace));
+    // A pagefault handler for faults caused by the `addr_space_cause_pagefaults`.
+    fn addr_space_handle_pagefaults(
+        addrspace: Weak<RwLock<AddrSpace>>,
+        pagefaults: impl Iterator<Item = PageFault>,
+        pagefault_counter: Arc<AtomicUsize>,
+        page_0_addr: PageAddr,
+        page_1_addr: PageAddr,
+    ) {
+        for pagefault in pagefaults {
+            println!("Got {:?}", pagefault);
+            let pagefault_counter = pagefault_counter.fetch_add(1, Ordering::Release);
 
-        let reserved = addrspace
-            .write()
-            .unwrap()
-            .reserve_any((2 * PAGE_SIZE).try_into().unwrap())
-            .unwrap();
+            let addrspace = if let Some(addrspace) = addrspace.upgrade() {
+                addrspace
+            } else {
+                println!("AddrSpace is dropped");
+                return;
+            };
 
-        let page_0_addr = reserved.start;
-        let page_1_addr = reserved
-            .start
-            .enclosing_range(PAGE_SIZE.try_into().unwrap())
-            .unwrap()
-            .end;
+            let addr = PageAddr::containing_page(NonNull::new(pagefault.addr()).unwrap()).unwrap();
+            let range = addr.enclosing_range(NonZeroUsize::new(1).unwrap()).unwrap();
 
-        let pagefault_counter = Arc::new(AtomicUsize::new(0));
-
-        let addrspace_weak = Arc::downgrade(&addrspace);
-        let pagefault_counter_clone = pagefault_counter.clone();
-        let pagefault_handler = thread::spawn(move || {
-            let mut buf = PageFaultBuffer::new(NonZeroUsize::new(1000).unwrap());
-            loop {
-                let pagefaults = match pagefault_receiver.recv(&mut buf) {
-                    Ok(faults) => faults,
-                    Err(PageFaultReceiverError::AddrSpaceDropped) => return Ok(()),
-                    Err(err) => return Err(err),
-                };
-                for pagefault in pagefaults {
-                    println!("Got {:?}", pagefault);
-                    let pagefault_counter = pagefault_counter_clone.fetch_add(1, Ordering::Relaxed);
-
-                    let addrspace = if let Some(addrspace) = addrspace_weak.upgrade() {
-                        addrspace
-                    } else {
-                        println!("AddrSpace is dropped");
-                        return Ok(());
-                    };
-
-                    let addr = PageAddr::containing_page(NonNull::new(pagefault.addr()).unwrap()).unwrap();
-                    let range = addr.enclosing_range(NonZeroUsize::new(1).unwrap()).unwrap();
-
-                    match pagefault_counter {
-                        0 => {
-                            assert_eq!(addr, page_0_addr);
-                            assert_eq!(pagefault.access(), SomePageAccess::ReadOnly);
-                            let data: [u8; PAGE_SIZE] = [42; PAGE_SIZE];
-                            addrspace
-                                .write()
-                                .unwrap()
-                                .give_access(&range, SomePageAccess::ReadOnly, Some(&data))
-                                .unwrap();
-                        }
-                        1 => {
-                            assert_eq!(addr, page_0_addr);
-                            assert_eq!(pagefault.access(), SomePageAccess::ReadWrite);
-                            addrspace.write().unwrap().upgrade_access(&range).unwrap();
-                        }
-                        2 => {
-                            assert_eq!(addr, page_1_addr);
-                            assert_eq!(pagefault.access(), SomePageAccess::ReadOnly);
-                            addrspace
-                                .write()
-                                .unwrap()
-                                .take_access(&page_0_addr.enclosing_range(PAGE_SIZE.try_into().unwrap()).unwrap())
-                                .unwrap();
-                            let data: [u8; PAGE_SIZE] = [11; PAGE_SIZE];
-                            addrspace
-                                .write()
-                                .unwrap()
-                                .give_access(&range, SomePageAccess::ReadWrite, Some(&data))
-                                .unwrap();
-                        }
-                        3 => {
-                            assert_eq!(addr, page_0_addr);
-                            assert_eq!(pagefault.access(), SomePageAccess::ReadOnly);
-                            addrspace
-                                .write()
-                                .unwrap()
-                                .downgrade_access(&page_1_addr.enclosing_range(PAGE_SIZE.try_into().unwrap()).unwrap())
-                                .unwrap();
-                            let data: [u8; PAGE_SIZE] = [17; PAGE_SIZE];
-                            addrspace
-                                .write()
-                                .unwrap()
-                                .give_access(&range, SomePageAccess::ReadOnly, Some(&data))
-                                .unwrap();
-                        }
-                        4 => {
-                            assert_eq!(addr, page_1_addr);
-                            assert_eq!(pagefault.access(), SomePageAccess::ReadWrite);
-                            addrspace.write().unwrap().upgrade_access(&range).unwrap();
-                        }
-
-                        _ => panic!("shouldn't have happened"),
-                    }
+            match pagefault_counter {
+                0 => {
+                    assert_eq!(addr, page_0_addr);
+                    assert_eq!(pagefault.access(), SomePageAccess::ReadOnly);
+                    let data: [u8; PAGE_SIZE] = [42; PAGE_SIZE];
+                    addrspace
+                        .write()
+                        .unwrap()
+                        .give_access(&range, SomePageAccess::ReadOnly, Some(&data))
+                        .unwrap();
                 }
+                1 => {
+                    assert_eq!(addr, page_0_addr);
+                    assert_eq!(pagefault.access(), SomePageAccess::ReadWrite);
+                    addrspace.write().unwrap().upgrade_access(&range).unwrap();
+                }
+                2 => {
+                    assert_eq!(addr, page_1_addr);
+                    assert_eq!(pagefault.access(), SomePageAccess::ReadOnly);
+                    addrspace
+                        .write()
+                        .unwrap()
+                        .take_access(&page_0_addr.enclosing_range(PAGE_SIZE.try_into().unwrap()).unwrap())
+                        .unwrap();
+                    let data: [u8; PAGE_SIZE] = [11; PAGE_SIZE];
+                    addrspace
+                        .write()
+                        .unwrap()
+                        .give_access(&range, SomePageAccess::ReadWrite, Some(&data))
+                        .unwrap();
+                }
+                3 => {
+                    assert_eq!(addr, page_0_addr);
+                    assert_eq!(pagefault.access(), SomePageAccess::ReadOnly);
+                    addrspace
+                        .write()
+                        .unwrap()
+                        .downgrade_access(&page_1_addr.enclosing_range(PAGE_SIZE.try_into().unwrap()).unwrap())
+                        .unwrap();
+                    let data: [u8; PAGE_SIZE] = [17; PAGE_SIZE];
+                    addrspace
+                        .write()
+                        .unwrap()
+                        .give_access(&range, SomePageAccess::ReadOnly, Some(&data))
+                        .unwrap();
+                }
+                4 => {
+                    assert_eq!(addr, page_1_addr);
+                    assert_eq!(pagefault.access(), SomePageAccess::ReadWrite);
+                    addrspace.write().unwrap().upgrade_access(&range).unwrap();
+                }
+
+                _ => panic!("shouldn't have happened"),
             }
-        });
+        }
+    }
 
-        let mapped = addrspace
-            .write()
-            .unwrap()
-            .map_anonymous(
-                &reserved,
-                ProtFlags::PROT_READ.union(ProtFlags::PROT_WRITE),
-                MapFlags::MAP_PRIVATE,
-            )
-            .unwrap();
-
-        let page_0_ptr = NonNull::from(mapped.start).as_ptr() as *mut u8;
-        let page_1_ptr = unsafe { page_0_ptr.add(PAGE_SIZE) };
+    fn addr_space_cause_pagefaults(pagefault_counter: Arc<AtomicUsize>, page_0_addr: PageAddr, page_1_addr: PageAddr) {
+        let page_0_ptr = NonNull::from(page_0_addr).as_ptr() as *mut u8;
+        let page_1_ptr = NonNull::from(page_1_addr).as_ptr() as *mut u8;
 
         {
             let page_0_val = unsafe { *(page_0_ptr) }; // 1st pagefault - page_0 RO access
@@ -1218,8 +1228,115 @@ mod tests {
             // engine_thread upgrades page_1 access to RW
         }
 
-        drop(addrspace);
-        pagefault_handler.join().unwrap().unwrap();
-        assert_eq!(pagefault_counter.load(Ordering::Relaxed), 5);
+        assert_eq!(pagefault_counter.load(Ordering::Acquire), 5);
+    }
+
+    #[test]
+    fn test_addr_space_pagefaults() {
+        let (addrspace, mut pagefault_receiver) = AddrSpace::new(true).unwrap();
+        let addrspace = Arc::new(RwLock::new(addrspace));
+
+        let reserved = addrspace
+            .write()
+            .unwrap()
+            .reserve_any((2 * PAGE_SIZE).try_into().unwrap())
+            .unwrap();
+        let mapped = addrspace
+            .write()
+            .unwrap()
+            .map_anonymous(
+                &reserved,
+                ProtFlags::PROT_READ.union(ProtFlags::PROT_WRITE),
+                MapFlags::MAP_PRIVATE,
+            )
+            .unwrap();
+
+        let page_0_addr = mapped.start;
+        let page_1_addr = mapped.start.enclosing_range(PAGE_SIZE.try_into().unwrap()).unwrap().end;
+
+        let pagefault_counter = Arc::new(AtomicUsize::new(0));
+
+        let addrspace_weak = Arc::downgrade(&addrspace);
+        let pagefault_counter_clone = pagefault_counter.clone();
+        let pagefault_handler = thread::spawn(move || {
+            let mut buf = PageFaultBuffer::new(NonZeroUsize::new(1000).unwrap());
+            loop {
+                let pagefaults = match pagefault_receiver.recv(&mut buf) {
+                    Ok(faults) => faults,
+                    Err(PageFaultReceiverError::AddrSpaceDropped) => return,
+                    Err(err) => panic!("failed receiving the pagefaults: {:?}", err),
+                };
+                addr_space_handle_pagefaults(
+                    addrspace_weak.clone(),
+                    pagefaults,
+                    pagefault_counter_clone.clone(),
+                    page_0_addr,
+                    page_1_addr,
+                );
+            }
+        });
+
+        thread::spawn(move || {
+            addr_space_cause_pagefaults(pagefault_counter, page_0_addr, page_1_addr);
+            drop(addrspace);
+        })
+        .join()
+        .unwrap();
+        pagefault_handler.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_addr_space_pagefaults_async() {
+        let (addrspace, pagefault_receiver) = AddrSpace::new(true).unwrap();
+        let addrspace = Arc::new(RwLock::new(addrspace));
+
+        let reserved = addrspace
+            .write()
+            .unwrap()
+            .reserve_any((2 * PAGE_SIZE).try_into().unwrap())
+            .unwrap();
+        let mapped = addrspace
+            .write()
+            .unwrap()
+            .map_anonymous(
+                &reserved,
+                ProtFlags::PROT_READ.union(ProtFlags::PROT_WRITE),
+                MapFlags::MAP_PRIVATE,
+            )
+            .unwrap();
+
+        let page_0_addr = mapped.start;
+        let page_1_addr = mapped.start.enclosing_range(PAGE_SIZE.try_into().unwrap()).unwrap().end;
+
+        let pagefault_counter = Arc::new(AtomicUsize::new(0));
+
+        let addrspace_weak = Arc::downgrade(&addrspace);
+        let pagefault_counter_clone = pagefault_counter.clone();
+        let pagefault_handler = tokio::spawn(async move {
+            let mut pagefault_receiver = PageFaultReceiverAsync::from(pagefault_receiver);
+            let mut buf = PageFaultBuffer::new(NonZeroUsize::new(1000).unwrap());
+            loop {
+                let pagefaults = match pagefault_receiver.recv(&mut buf).await {
+                    Ok(faults) => faults,
+                    Err(PageFaultReceiverError::AddrSpaceDropped) => return,
+                    Err(err) => panic!("failed receiving the pagefaults: {:?}", err),
+                };
+                addr_space_handle_pagefaults(
+                    addrspace_weak.clone(),
+                    pagefaults,
+                    pagefault_counter_clone.clone(),
+                    page_0_addr,
+                    page_1_addr,
+                );
+            }
+        });
+
+        tokio::task::spawn_blocking(move || {
+            addr_space_cause_pagefaults(pagefault_counter, page_0_addr, page_1_addr);
+            drop(addrspace);
+        })
+        .await
+        .unwrap();
+        pagefault_handler.await.unwrap();
     }
 }
