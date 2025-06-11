@@ -25,7 +25,7 @@ use super::{
     userfaultfd_ext::{UserfaultFdFlags, userfaultfd_create},
 };
 
-use userfaultfd as uffd;
+use userfaultfd::{self as uffd, EventBuffer};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +94,7 @@ pub enum AddrSpaceError {
 
 impl AddrSpace {
     #[allow(dead_code)]
-    pub fn new(user_mode_only: bool) -> Result<(AddrSpace, AddrSpaceEngine), AddrSpaceError> {
+    pub fn new(user_mode_only: bool) -> Result<(AddrSpace, PageFaultReceiver), AddrSpaceError> {
         let required_features = uffd::FeatureFlags::PAGEFAULT_FLAG_WP.union(uffd::FeatureFlags::THREAD_ID);
         let required_ioctls = uffd::IoctlFlags::REGISTER
             .union(uffd::IoctlFlags::UNREGISTER)
@@ -129,7 +129,7 @@ impl AddrSpace {
             pages: Default::default(),
             access: Default::default(),
         };
-        let fault_receiver = AddrSpaceEngine { alive: alive_rx, uffd };
+        let fault_receiver = PageFaultReceiver { alive: alive_rx, uffd };
         Ok((addrspace, fault_receiver))
     }
 
@@ -676,80 +676,87 @@ impl AddrSpace {
 }
 
 #[allow(dead_code)]
-pub struct AddrSpaceEngine {
+pub struct PageFaultReceiver {
     alive: OwnedFd,
     uffd: Arc<uffd::Uffd>,
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Error)]
-pub enum AddrSpaceEngineError {
-    #[error("Fault handler error ({errno})")]
-    FaultHandlerError { errno: Errno },
+pub enum PageFaultReceiverError {
+    #[error("AddrSpace is dropped")]
+    AddrSpaceDropped,
 
     #[error("Generic runtime error ({errno}): {msg}")]
     RuntimeError { msg: String, errno: Errno },
 }
 
-impl AddrSpaceEngine {
+#[allow(dead_code)]
+pub struct PageFaultBuffer(EventBuffer);
+impl PageFaultBuffer {
     #[allow(dead_code)]
-    pub fn run<F>(self, fault_handler: F) -> Result<(), AddrSpaceEngineError>
-    where
-        F: Fn(PageFault) -> Result<(), Errno>,
-    {
+    pub fn new(size: NonZeroUsize) -> Self {
+        Self(EventBuffer::new(size.get()))
+    }
+}
+
+impl PageFaultReceiver {
+    fn wait_readable(&self) -> Result<(), PageFaultReceiverError> {
         let mut fds = [
             PollFd::new(self.uffd.as_fd(), PollFlags::POLLIN),
-            PollFd::new(self.alive.as_fd(), PollFlags::empty()),
+            PollFd::new(self.alive.as_fd(), PollFlags::POLLIN),
         ];
-        let mut events_buf = uffd::EventBuffer::new(1024);
+
         loop {
-            loop {
-                let mut num_unhandled_revents = match poll(&mut fds, PollTimeout::NONE) {
-                    Ok(ret) => {
-                        assert!(ret >= 0, "poll shouldn't have failed");
-                        assert_ne!(ret, 0, "poll shouldn't have timeouted");
-                        ret
-                    }
-                    Err(errno) => {
-                        match errno {
-                            Errno::EINTR => continue, // retry if poll is interrupted
-                            _ => {
-                                return Err(AddrSpaceEngineError::RuntimeError {
-                                    msg: "polling userfaultfd failed".into(),
-                                    errno,
-                                });
-                            }
+            let mut num_unhandled_revents = match poll(&mut fds, PollTimeout::NONE) {
+                Ok(ret) => {
+                    assert!(ret >= 0, "poll shouldn't have failed");
+                    assert_ne!(ret, 0, "poll shouldn't have timeouted");
+                    ret
+                }
+                Err(errno) => {
+                    match errno {
+                        Errno::EINTR => continue, // retry if poll is interrupted
+                        _ => {
+                            return Err(PageFaultReceiverError::RuntimeError {
+                                msg: "polling userfaultfd failed".into(),
+                                errno,
+                            });
                         }
                     }
-                };
+                }
+            };
 
-                let uffd_fd = &mut fds[0];
-                if let Some(mut revents) = uffd_fd.revents() {
-                    if revents.contains(PollFlags::POLLIN) {
-                        revents.remove(PollFlags::POLLIN);
-                        num_unhandled_revents -= 1;
-                    }
-                    assert!(revents.is_empty(), "should've received only POLLIN");
+            let uffd_fd = &mut fds[0];
+            if let Some(mut revents) = uffd_fd.revents() {
+                if revents.contains(PollFlags::POLLIN) {
+                    revents.remove(PollFlags::POLLIN);
+                    num_unhandled_revents -= 1;
                 }
-                match num_unhandled_revents {
-                    0 => break,         // only POLLIN revent from the userfaultfd is received
-                    1 => return Ok(()), // unhandled event is from the `self.alive`, which means that AddrSpace is dropped
-                    _ => panic!("shouldn't have more than 1 unhandled revent"),
-                }
+                assert!(revents.is_empty(), "should've received only POLLIN");
             }
+            match num_unhandled_revents {
+                0 => return Ok(()), // only POLLIN revent from the userfaultfd is received
+                1 => return Err(PageFaultReceiverError::AddrSpaceDropped), // unhandled event is from the `self.alive`, which means that AddrSpace is dropped
+                _ => panic!("shouldn't have more than 1 unhandled revent"),
+            }
+        }
+    }
 
-            let events = self
-                .uffd
-                .read_events(&mut events_buf)
-                .map_err(|err| AddrSpaceEngineError::RuntimeError {
-                    msg: format!("userfaultfd failed during event read: {}", err),
-                    errno: Errno::UnknownErrno,
-                })?;
-            for event in events {
-                let event = event.map_err(|err| AddrSpaceEngineError::RuntimeError {
-                    msg: format!("userfaultfd event error: {}", err),
-                    errno: Errno::UnknownErrno,
-                })?;
+    fn recv_nonblocking<'a>(
+        &mut self,
+        buf: &'a mut PageFaultBuffer,
+    ) -> Result<impl Iterator<Item = PageFault> + 'a, PageFaultReceiverError> {
+        let pagefaults = self
+            .uffd
+            .read_events(&mut buf.0)
+            .map_err(|err| PageFaultReceiverError::RuntimeError {
+                msg: format!("userfaultfd failed during event read: {}", err),
+                errno: Errno::UnknownErrno,
+            })?
+            .map(|event| {
+                let event = event.expect("reading userfaultfd events shouldn't have failed");
+
                 if let uffd::Event::Pagefault {
                     kind: _,
                     rw,
@@ -762,17 +769,25 @@ impl AddrSpaceEngine {
                     } else {
                         SomePageAccess::ReadOnly
                     };
-                    fault_handler(PageFault {
+                    PageFault {
                         addr,
                         access,
                         thread_id: Pid::from_raw(thread_id.as_raw()),
-                    })
-                    .map_err(|errno| AddrSpaceEngineError::FaultHandlerError { errno })?;
+                    }
                 } else {
                     panic!("shouldn't have received any other event");
                 }
-            }
-        }
+            });
+        Ok(pagefaults)
+    }
+
+    #[allow(dead_code)]
+    fn recv<'a>(
+        &mut self,
+        buf: &'a mut PageFaultBuffer,
+    ) -> Result<impl Iterator<Item = PageFault> + 'a, PageFaultReceiverError> {
+        self.wait_readable()?;
+        self.recv_nonblocking(buf)
     }
 }
 
@@ -833,7 +848,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_reserve_release() {
-        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, _pagefault_receiver) = AddrSpace::new(true).unwrap();
         let reserved = addrspace.reserve_any(1.try_into().unwrap()).unwrap();
         assert_eq!(reserved.len().get(), PAGE_SIZE);
         assert!(addrspace.access.is_empty());
@@ -863,7 +878,7 @@ mod tests {
         let external: PageAddr = mapped.addr().try_into().unwrap();
         let external = external.enclosing_range(mapped.length()).unwrap();
 
-        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, _pagefault_receiver) = AddrSpace::new(true).unwrap();
 
         // AddrSpace shouldn't reserve externally mapped range
         let result = addrspace.reserve(&external);
@@ -874,7 +889,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_map_unmap() {
-        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, _pagefault_receiver) = AddrSpace::new(true).unwrap();
 
         assert!(
             addrspace
@@ -931,7 +946,7 @@ mod tests {
         let external: PageAddr = mapped.addr().try_into().unwrap();
         let external = external.enclosing_range(mapped.length()).unwrap();
 
-        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, _pagefault_receiver) = AddrSpace::new(true).unwrap();
 
         // AddrSpace shouldn't map over externally mapped range
         let result = addrspace.map_anonymous(
@@ -946,7 +961,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_protect() {
-        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, _pagefault_receiver) = AddrSpace::new(true).unwrap();
 
         addrspace.reserve_any(PAGE_SIZE.try_into().unwrap()).unwrap();
         let mapped = addrspace
@@ -1006,7 +1021,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_give_upgrade_downgrade_take_access() {
-        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
+        let (mut addrspace, _pagefault_receiver) = AddrSpace::new(true).unwrap();
 
         addrspace.reserve_any(PAGE_SIZE.try_into().unwrap()).unwrap();
         let mapped = addrspace
@@ -1063,7 +1078,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_pagefaults() {
-        let (addrspace, engine) = AddrSpace::new(true).unwrap();
+        let (addrspace, mut pagefault_receiver) = AddrSpace::new(true).unwrap();
         let addrspace = Arc::new(RwLock::new(addrspace));
 
         let reserved = addrspace
@@ -1079,15 +1094,21 @@ mod tests {
             .unwrap()
             .end;
 
-        let fault_counter = Arc::new(AtomicUsize::new(0));
+        let pagefault_counter = Arc::new(AtomicUsize::new(0));
 
         let addrspace_weak = Arc::downgrade(&addrspace);
-        let fault_counter_clone = fault_counter.clone();
-        let engine_thread = thread::spawn(move || {
-            engine
-                .run(|pagefault| {
+        let pagefault_counter_clone = pagefault_counter.clone();
+        let pagefault_handler = thread::spawn(move || {
+            let mut buf = PageFaultBuffer::new(NonZeroUsize::new(1000).unwrap());
+            loop {
+                let pagefaults = match pagefault_receiver.recv(&mut buf) {
+                    Ok(faults) => faults,
+                    Err(PageFaultReceiverError::AddrSpaceDropped) => return Ok(()),
+                    Err(err) => return Err(err),
+                };
+                for pagefault in pagefaults {
                     println!("Got {:?}", pagefault);
-                    let fault_counter = fault_counter_clone.fetch_add(1, Ordering::Relaxed);
+                    let pagefault_counter = pagefault_counter_clone.fetch_add(1, Ordering::Relaxed);
 
                     let addrspace = if let Some(addrspace) = addrspace_weak.upgrade() {
                         addrspace
@@ -1099,7 +1120,7 @@ mod tests {
                     let addr = PageAddr::containing_page(NonNull::new(pagefault.addr()).unwrap()).unwrap();
                     let range = addr.enclosing_range(NonZeroUsize::new(1).unwrap()).unwrap();
 
-                    match fault_counter {
+                    match pagefault_counter {
                         0 => {
                             assert_eq!(addr, page_0_addr);
                             assert_eq!(pagefault.access(), SomePageAccess::ReadOnly);
@@ -1153,9 +1174,8 @@ mod tests {
 
                         _ => panic!("shouldn't have happened"),
                     }
-                    Ok(())
-                })
-                .unwrap();
+                }
+            }
         });
 
         let mapped = addrspace
@@ -1199,7 +1219,7 @@ mod tests {
         }
 
         drop(addrspace);
-        engine_thread.join().unwrap();
-        assert_eq!(fault_counter.load(Ordering::Relaxed), 5);
+        pagefault_handler.join().unwrap().unwrap();
+        assert_eq!(pagefault_counter.load(Ordering::Relaxed), 5);
     }
 }
