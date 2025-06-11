@@ -151,7 +151,7 @@ impl AddrSpace {
 
         let reserved = PageAddr::try_from(mmapped.addr()).expect("mmap_anonymous should've returned a page address");
         let reserved = reserved
-            .enclosing_range(mmapped.length())
+            .enclosing_range(mmapped.len())
             .expect("mmap_anonymous should've returned pages that can be represented by the PageAddr");
 
         let supported_ioctls = self
@@ -211,7 +211,7 @@ impl AddrSpace {
 
         let reserved = PageAddr::try_from(mmapped.addr()).expect("mmap_anonymous should've returned a page address");
         let reserved = reserved
-            .enclosing_range(mmapped.length())
+            .enclosing_range(mmapped.len())
             .expect("mmap_anonymous should've returned pages that can be represented by the PageAddr");
 
         let supported_ioctls = self
@@ -803,7 +803,7 @@ mod util {
         pub fn addr(&self) -> NonNull<c_void> {
             self.0.expect("invariant: inner data is Some until consumed").0
         }
-        pub fn length(&self) -> NonZeroUsize {
+        pub fn len(&self) -> NonZeroUsize {
             self.0.expect("invariant: inner data is Some until consumed").1
         }
         pub fn consume(mut self) -> (NonNull<c_void>, NonZeroUsize) {
@@ -876,7 +876,7 @@ mod tests {
         };
         let mapped = unsafe { MmapGuard::from_raw(mapped, PAGE_SIZE.try_into().unwrap()) };
         let external: PageAddr = mapped.addr().try_into().unwrap();
-        let external = external.enclosing_range(mapped.length()).unwrap();
+        let external = external.enclosing_range(mapped.len()).unwrap();
 
         let (mut addrspace, _pagefault_receiver) = AddrSpace::new(true).unwrap();
 
@@ -944,7 +944,7 @@ mod tests {
         };
         let mapped = unsafe { MmapGuard::from_raw(mapped, PAGE_SIZE.try_into().unwrap()) };
         let external: PageAddr = mapped.addr().try_into().unwrap();
-        let external = external.enclosing_range(mapped.length()).unwrap();
+        let external = external.enclosing_range(mapped.len()).unwrap();
 
         let (mut addrspace, _pagefault_receiver) = AddrSpace::new(true).unwrap();
 
