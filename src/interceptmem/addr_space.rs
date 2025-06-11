@@ -833,11 +833,7 @@ mod tests {
 
     #[test]
     fn test_addr_space_reserve_release() {
-        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
-        let engine_thread = thread::spawn(move || {
-            engine.run(|_pagefault| Ok(())).unwrap();
-        });
-
+        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
         let reserved = addrspace.reserve_any(1.try_into().unwrap()).unwrap();
         assert_eq!(reserved.len().get(), PAGE_SIZE);
         assert!(addrspace.access.is_empty());
@@ -850,9 +846,6 @@ mod tests {
         addrspace.release(&reserved).unwrap();
         assert!(addrspace.pages.is_empty());
         assert!(addrspace.access.is_empty());
-
-        drop(addrspace);
-        engine_thread.join().unwrap();
     }
 
     #[test]
@@ -870,27 +863,18 @@ mod tests {
         let external: PageAddr = mapped.addr().try_into().unwrap();
         let external = external.enclosing_range(mapped.length()).unwrap();
 
-        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
-        let engine_thread = thread::spawn(move || {
-            engine.run(|_pagefault| Ok(())).unwrap();
-        });
+        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
 
         // AddrSpace shouldn't reserve externally mapped range
         let result = addrspace.reserve(&external);
         assert!(result.is_err());
         assert!(addrspace.pages.is_empty());
         assert!(addrspace.access.is_empty());
-
-        drop(addrspace);
-        engine_thread.join().unwrap();
     }
 
     #[test]
     fn test_addr_space_map_unmap() {
-        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
-        let engine_thread = thread::spawn(move || {
-            engine.run(|_pagefault| Ok(())).unwrap();
-        });
+        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
 
         assert!(
             addrspace
@@ -930,9 +914,6 @@ mod tests {
 
             assert!(addrspace.access.is_empty());
         }
-
-        drop(addrspace);
-        engine_thread.join().unwrap();
     }
 
     #[test]
@@ -950,10 +931,7 @@ mod tests {
         let external: PageAddr = mapped.addr().try_into().unwrap();
         let external = external.enclosing_range(mapped.length()).unwrap();
 
-        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
-        let engine_thread = thread::spawn(move || {
-            engine.run(|_pagefault| Ok(())).unwrap();
-        });
+        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
 
         // AddrSpace shouldn't map over externally mapped range
         let result = addrspace.map_anonymous(
@@ -964,17 +942,11 @@ mod tests {
         assert!(result.is_err());
         assert!(addrspace.pages.is_empty());
         assert!(addrspace.access.is_empty());
-
-        drop(addrspace);
-        engine_thread.join().unwrap();
     }
 
     #[test]
     fn test_addr_space_protect() {
-        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
-        let engine_thread = thread::spawn(move || {
-            engine.run(|_pagefault| Ok(())).unwrap();
-        });
+        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
 
         addrspace.reserve_any(PAGE_SIZE.try_into().unwrap()).unwrap();
         let mapped = addrspace
@@ -1030,17 +1002,11 @@ mod tests {
             mem_ops.write(NonNull::from(mapped.start).as_ptr(), &mem_ops_tmp_buf),
             Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
         );
-
-        drop(addrspace);
-        engine_thread.join().unwrap();
     }
 
     #[test]
     fn test_addr_space_give_upgrade_downgrade_take_access() {
-        let (mut addrspace, engine) = AddrSpace::new(true).unwrap();
-        let engine_thread = thread::spawn(move || {
-            engine.run(|_pagefault| Ok(())).unwrap();
-        });
+        let (mut addrspace, _engine) = AddrSpace::new(true).unwrap();
 
         addrspace.reserve_any(PAGE_SIZE.try_into().unwrap()).unwrap();
         let mapped = addrspace
@@ -1093,9 +1059,6 @@ mod tests {
             mem_ops.write(NonNull::from(mapped.start).as_ptr(), &mem_ops_tmp_buf),
             Err(crate::interceptmem::mem_ops::NonFaultingMemOpsError::WouldFault)
         );
-
-        drop(addrspace);
-        engine_thread.join().unwrap();
     }
 
     #[test]
