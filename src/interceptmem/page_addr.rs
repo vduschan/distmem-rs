@@ -5,6 +5,8 @@ use std::{
     ptr::NonNull,
 };
 
+use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::nonempty_range::NonEmptyRange;
@@ -16,7 +18,7 @@ pub const PAGE_SIZE: usize = 1 << PAGE_BITS;
 #[allow(dead_code)]
 pub const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Encode, Decode)]
 pub struct PageAddr(NonZeroUsize);
 
 impl std::fmt::Debug for PageAddr {

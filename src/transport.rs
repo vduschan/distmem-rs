@@ -16,6 +16,8 @@ use tokio::{
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
+use crate::{interceptmem::page_addr::PageAddr, nonempty_range::NonEmptyRange};
+
 #[derive(Debug, Default)]
 pub struct RequestIdFactory(usize);
 impl RequestIdFactory {
@@ -33,11 +35,13 @@ pub struct RequestId(usize);
 #[derive(Debug, Serialize, Deserialize, Encode, Decode)]
 pub enum Request {
     Ping(usize),
+    Reserve(NonEmptyRange<PageAddr>),
 }
 
 #[derive(Debug, Serialize, Deserialize, Encode, Decode)]
 pub enum Response {
     Ping(usize),
+    Reserve(Result<(), ()>),
 }
 
 #[derive(Debug, Serialize, Deserialize, Encode, Decode)]

@@ -3,9 +3,11 @@ use std::{
     ops::{Deref, Range},
 };
 
+use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct NonEmptyRange<T>(Range<T>);
 
 #[derive(Debug, Error, Clone)]

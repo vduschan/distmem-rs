@@ -7,7 +7,11 @@ use tokio::{
 };
 
 use crate::{
-    interceptmem::addr_space::{AddrSpace, PageFaultBuffer, PageFaultReceiverAsync, PageFaultReceiverError},
+    interceptmem::{
+        addr_space::{AddrSpace, PageFaultBuffer, PageFaultReceiverAsync, PageFaultReceiverError},
+        page_addr::PageAddr,
+    },
+    nonempty_range::NonEmptyRange,
     transport::{Request, Response, TransportReceiver, TransportSender, new_transport},
 };
 
@@ -21,8 +25,15 @@ mod engine {
 
     use super::*;
 
-    async fn handle_transport_request(_request: PendingRequest, _state: Arc<RwLock<State>>) {
-        todo!()
+    async fn handle_transport_request(request: PendingRequest, state: Arc<RwLock<State>>) {
+        let response = match request.request() {
+            Request::Ping(val) => Response::Ping(*val),
+            Request::Reserve(range) => {
+                let ret = state.write().await.addrspace.reserve(range).map_err(|_err| ());
+                Response::Reserve(ret)
+            }
+        };
+        request.complete_request(response).await.unwrap();
     }
 
     async fn transport_handler(mut transport_receiver: TransportReceiver, state: Arc<RwLock<State>>) {
@@ -138,5 +149,26 @@ impl DistAddrSpace {
         let (response_sender, response_receiver) = oneshot::channel();
         self.request_sender.send((request, response_sender)).await.unwrap();
         response_receiver.await.unwrap()
+    }
+
+    pub async fn reserve_any(&self, length: NonZeroUsize) -> NonEmptyRange<PageAddr> {
+        let mut to_release = Vec::new();
+        let reserved = loop {
+            let reserved = self.state.write().await.addrspace.reserve_any(length).unwrap();
+            if let Response::Reserve(ret) = self.request(Request::Reserve(reserved.clone())).await {
+                if ret.is_ok() {
+                    break reserved;
+                } else {
+                    to_release.push(reserved);
+                }
+            } else {
+                panic!("logic error: got wrong response");
+            }
+        };
+        let mut state = self.state.write().await;
+        for range in to_release {
+            state.addrspace.release(&range).unwrap();
+        }
+        reserved
     }
 }

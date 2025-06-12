@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, process};
+use std::{net::SocketAddr, num::NonZeroUsize, process};
 
 use distmem_rs::distmem::DistAddrSpace;
 use nix::{
@@ -49,5 +49,9 @@ async fn child(listener: std::net::TcpListener) {
     let stream = listener.accept().await.unwrap().0;
     println!("Child got TcpStream");
 
-    let _addrspace = DistAddrSpace::new(stream, true);
+    let addrspace = DistAddrSpace::new(stream, true);
+    let reserved = addrspace
+        .reserve_any(NonZeroUsize::new(1024 * 1024 * 1024 /* 1GB */).unwrap())
+        .await;
+    println!("Child reserved {:?}", reserved);
 }
