@@ -1,5 +1,6 @@
 use std::{num::NonZeroUsize, sync::Arc};
 
+use nix::sys::mman::{MapFlags, ProtFlags};
 use tokio::{
     net::TcpStream,
     sync::{RwLock, mpsc, oneshot},
@@ -41,6 +42,18 @@ mod engine {
             Request::Reserve(range) => {
                 let ret = state.write().await.addrspace.reserve(range).map_err(|_err| ());
                 Response::Reserve(ret)
+            }
+            Request::Map(range, prot, flags) => {
+                let ret = state
+                    .write()
+                    .await
+                    .addrspace
+                    .map_anonymous(range, (*prot).into(), (*flags).into());
+                let ret = match ret {
+                    Ok(_) => Ok(()),
+                    Err(_) => Ok(()),
+                };
+                Response::Map(ret)
             }
         };
         request.complete_request(response).await.unwrap();
@@ -180,5 +193,28 @@ impl DistAddrSpace {
             state.addrspace.release(&range).unwrap();
         }
         reserved
+    }
+    pub async fn map_anonymous_any(
+        &self,
+        length: NonZeroUsize,
+        prot: ProtFlags,
+        flags: MapFlags,
+    ) -> NonEmptyRange<PageAddr> {
+        let mapped = self
+            .state
+            .write()
+            .await
+            .addrspace
+            .map_anonymous_any(length, prot, flags)
+            .unwrap();
+        if let Response::Map(ret) = self
+            .request(Request::Map(mapped.clone(), prot.into(), flags.into()))
+            .await
+        {
+            ret.unwrap();
+            mapped
+        } else {
+            panic!("logic error: got wrong response");
+        }
     }
 }

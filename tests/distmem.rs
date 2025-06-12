@@ -3,7 +3,10 @@ use std::{net::SocketAddr, num::NonZeroUsize, process};
 use distmem_rs::distmem::DistAddrSpace;
 use nix::{
     libc::EXIT_SUCCESS,
-    sys::wait::{WaitStatus, waitpid},
+    sys::{
+        mman::{MapFlags, ProtFlags},
+        wait::{WaitStatus, waitpid},
+    },
     unistd::{ForkResult, fork},
 };
 use tokio::{
@@ -50,8 +53,18 @@ async fn child(listener: std::net::TcpListener) {
     println!("Child got TcpStream");
 
     let addrspace = DistAddrSpace::new(stream, true);
+
     let reserved = addrspace
         .reserve_any(NonZeroUsize::new(1024 * 1024 * 1024 /* 1GB */).unwrap())
         .await;
     println!("Child reserved {:?}", reserved);
+
+    let mapped = addrspace
+        .map_anonymous_any(
+            NonZeroUsize::new(1).unwrap(),
+            ProtFlags::PROT_READ.union(ProtFlags::PROT_WRITE),
+            MapFlags::MAP_PRIVATE,
+        )
+        .await;
+    println!("Child mapped {:?}", mapped);
 }
