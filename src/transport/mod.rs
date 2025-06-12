@@ -1,9 +1,12 @@
+pub mod data;
+
 use std::{collections::HashMap, sync::Arc};
 
 use bincode::{
     Decode, Encode,
     error::{DecodeError, EncodeError},
 };
+use data::{Request, Response};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -15,8 +18,6 @@ use tokio::{
     sync::{Mutex, oneshot},
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-
-use crate::{interceptmem::page_addr::PageAddr, nonempty_range::NonEmptyRange};
 
 #[derive(Debug, Default)]
 pub struct RequestIdFactory(usize);
@@ -31,18 +32,6 @@ impl RequestIdFactory {
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct RequestId(usize);
-
-#[derive(Debug, Serialize, Deserialize, Encode, Decode)]
-pub enum Request {
-    Ping(usize),
-    Reserve(NonEmptyRange<PageAddr>),
-}
-
-#[derive(Debug, Serialize, Deserialize, Encode, Decode)]
-pub enum Response {
-    Ping(usize),
-    Reserve(Result<(), ()>),
-}
 
 #[derive(Debug, Serialize, Deserialize, Encode, Decode)]
 pub enum Message {

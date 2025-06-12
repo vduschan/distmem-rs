@@ -12,7 +12,11 @@ use crate::{
         page_addr::PageAddr,
     },
     nonempty_range::NonEmptyRange,
-    transport::{Request, Response, TransportReceiver, TransportSender, new_transport},
+    transport::{
+        TransportReceiver, TransportSender,
+        data::{Request, Response},
+        new_transport,
+    },
 };
 
 #[allow(dead_code)]
@@ -21,7 +25,13 @@ struct State {
 }
 
 mod engine {
-    use crate::{interceptmem::addr_space::PageFault, transport::PendingRequest};
+    use crate::{
+        interceptmem::addr_space::PageFault,
+        transport::{
+            PendingRequest,
+            data::{Request, Response},
+        },
+    };
 
     use super::*;
 
