@@ -1,3 +1,4 @@
+pub mod distmem;
 mod interceptmem;
 mod nonempty_range;
 mod transport;

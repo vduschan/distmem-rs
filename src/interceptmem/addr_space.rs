@@ -34,6 +34,7 @@ pub struct PageFault {
     access: SomePageAccess,
     thread_id: Pid,
 }
+unsafe impl Send for PageFault {}
 
 impl PageFault {
     #[allow(dead_code)]
